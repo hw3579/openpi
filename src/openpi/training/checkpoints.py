@@ -44,7 +44,15 @@ def initialize_checkpoint_dir(
             max_to_keep=1,
             keep_period=keep_period,
             create=False,
-            async_options=ocp.AsyncOptions(timeout_secs=7200),
+            # 完全禁用异步checkpoint
+            enable_async_checkpointing=False,
+            # 移除异步选项
+            # async_options=ocp.AsyncOptions(timeout_secs=7200),
+            cleanup_tmp_directories=True,
+            # 启用单主机加载和广播
+            single_host_load_and_broadcast=True,
+            # 启用后台删除
+            enable_background_delete=True,
         ),
     )
 
@@ -79,7 +87,48 @@ def save_state(
         "train_state": train_state,
         "params": {"params": params},
     }
-    checkpoint_manager.save(step, items)
+    # checkpoint_manager.save(step, items) # orbax-checkpoint 0.11.13->0.11.1
+        # 添加错误处理和重试机制
+    max_retries = 50
+    for attempt in range(max_retries):
+        try:
+            # 在保存前等待之前的操作完成
+            checkpoint_manager.wait_until_finished()
+            
+            # 清理可能存在的临时文件
+            import glob
+            checkpoint_dir = str(checkpoint_manager.directory)
+            tmp_pattern = f"{checkpoint_dir}/*.orbax-checkpoint-tmp-*"
+            tmp_files = glob.glob(tmp_pattern)
+            for tmp_file in tmp_files:
+                try:
+                    import shutil
+                    if epath.Path(tmp_file).is_dir():
+                        shutil.rmtree(tmp_file)
+                        logging.info(f"Cleaned up temp file: {tmp_file}")
+                except Exception as e:
+                    logging.warning(f"Could not clean temp file {tmp_file}: {e}")
+            
+            # 保存checkpoint
+            checkpoint_manager.save(step, items)
+            
+            # 等待保存完成
+            checkpoint_manager.wait_until_finished()
+            
+            logging.info(f"Successfully saved checkpoint at step {step}")
+            break
+            
+        except Exception as e:
+            logging.error(f"Checkpoint save attempt {attempt + 1} failed: {e}")
+            
+            if attempt == max_retries - 1:
+                # 最后一次尝试失败，抛出异常
+                raise e
+            else:
+                # 等待一段时间后重试
+                import time
+                time.sleep(2)
+                logging.info(f"Retrying checkpoint save in 2 seconds...")
 
 
 def restore_state(

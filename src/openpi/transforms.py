@@ -58,7 +58,7 @@ class Group:
         """
         return Group(inputs=(*self.inputs, *inputs), outputs=(*outputs, *self.outputs))
 
-
+import torch
 @dataclasses.dataclass(frozen=True)
 class CompositeTransform(DataTransformFn):
     """A composite transform that applies a sequence of transforms in order."""
@@ -67,6 +67,19 @@ class CompositeTransform(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         for transform in self.transforms:
+            # 检查data是否为字典
+            if isinstance(data, dict):
+                # 遍历字典中的所有键值对
+                for key, value in data.items():
+                    # 情况1: 直接检查值是否为256*256*3的一维tensor
+                    if (hasattr(value, 'ndim') and hasattr(value, 'numel') and 
+                        value.ndim == 1 and 
+                        value.numel() == 256 * 256 * 3):
+                        # 正确的reshape方式：直接reshape为(H,W,C)格式
+                        reshaped = value.reshape(256, 256, 3).to(torch.uint8)
+                        data[key] = reshaped
+                        # print(f"已将一维tensor正确转换为HWC图像: {key} {reshaped.shape}")
+                    
             data = transform(data)
         return data
 
@@ -209,8 +222,17 @@ class DeltaActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        data["actions"] = actions
+
+        delta = np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+
+        if hasattr(actions, 'at'):
+            # JAX array: use .at[].add() with negative delta for subtraction
+            data["actions"] = actions.at[..., :dims].add(-delta)
+        else:
+            # NumPy array: in-place modification
+            actions = np.array(actions)  # ensure it's a writable copy
+            actions[..., :dims] -= delta
+            data["actions"] = actions
 
         return data
 
@@ -231,8 +253,19 @@ class AbsoluteActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        data["actions"] = actions
+        
+        # 计算需要加上的delta值
+        delta = np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        
+        # 检查actions是否是JAX数组
+        if hasattr(actions, 'at'):
+            # JAX数组：使用.at[].add()方法
+            data["actions"] = actions.at[..., :dims].add(delta)
+        else:
+            # NumPy数组：使用原地修改
+            actions = np.array(actions)  # 确保是可修改的副本
+            actions[..., :dims] += delta
+            data["actions"] = actions
 
         return data
 

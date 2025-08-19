@@ -25,6 +25,8 @@ dependencies = [
     "openpi-client",
     "orbax-checkpoint==0.11.13",
     "pillow>=11.0.0",
+    "protobuf>=4.21.6,<5.0.0",
+    "flwr>=1.20.0",
     "s3fs>=2024.9.0",
     "sentencepiece>=0.2.0",
     "torch>=2.7.0",
@@ -38,7 +40,7 @@ dependencies = [
     "beartype==0.19.0",
     "treescope>=0.1.7",
     "transformers==4.48.1",
-    "rich>=14.0.0",
+    "rich>=13.5.0,<14.0.0",
     "polars>=1.30.0",
 ]
 
@@ -131,3 +133,129 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 markers = ["manual: should be run manually."]
 testpaths = ["src", "scripts", "packages"]
+
+
+# ============================================================
+# Flower Application Configuration
+# ============================================================
+
+[tool.flwr.app]
+# 发布者（通常保持 flower 即可）
+publisher = "flower"
+
+# ------------------------------------------------------------
+# 定义服务端和客户端的入口对象
+# 格式: "<module>:<object>"
+# ------------------------------------------------------------
+[tool.flwr.app.components]
+# 示例：CLI 启动的 server 和 client
+# serverapp = "scripts.federated.server_flwr_cli:app"
+# clientapp = "scripts.federated.client_flwr_cli:app"
+
+# 当前实际使用的配置（基于 disk）
+serverapp = "scripts.federated_disk.server_flwr_disk:app"
+# clientapp = "scripts.federated_disk.client_flwr_disk:app"
+clientapp = "scripts.federated_disk.client_flwr_disk_noniid:app"
+
+# ------------------------------------------------------------
+# 自定义运行配置，可通过 context.run_config 访问
+# ------------------------------------------------------------
+[tool.flwr.app.config]
+# 训练轮数
+num-server-rounds = 20
+
+# 客户端参与条件
+min-fit-clients = 6
+min-available-clients = 6
+fraction-fit = 1.0        # 每一轮参与训练的客户端比例
+fraction-evaluate = 0.0   # 每一轮参与评估的客户端比例
+
+# 基础配置
+config-name = "pi0_libero_0813_fl"   # 当前实验/配置名称
+total-clients = 6                    # 总客户端数
+virtual-clients = 1                  # 每台物理机模拟的客户端数
+max-parallel-clients = 1             # 最大并发客户端数
+
+# 本地训练参数
+local-steps = 1000
+batch-size = 32
+num-workers = 4
+fsdp-devices = 1                     # FSDP 并行设备数
+
+# 训练过程行为控制
+release-after-fit = true             # 训练完成是否释放客户端
+exit-after-fit = true                # 完成一次 fit 后是否退出
+snapshot-interval = 1                # 快照保存间隔（以轮为单位）
+# snapshot-dir = "./checkpoints/pi0_libero_0813_fl"  # 可指定快照目录
+# 快照的实验子目录名（默认 flwr），最终路径为 ./checkpoints/<config-name>/<snapshot-exp>/
+snapshot-exp = "flwr_non_iid_0819"
+resume = false                       # 是否从快照恢复
+
+# 是否在 cache 中保留每一轮的全局权重（不做保留策略删除）
+keep-all-globals = true              # 新增选项
+
+# 精度设置
+store-precision = "fp32"             # 存储时精度
+agg-precision = "fp32"               # 聚合时精度
+
+# ============================================================
+# 联邦学习环境配置
+# ============================================================
+
+[tool.flwr.federations]
+# 默认使用的 federation 配置
+default = "local-simulation"
+
+# ------------------------------------------------------------
+# 本地模拟（Simulation）环境
+# 使用 2 个虚拟 SuperNodes
+# ------------------------------------------------------------
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 6
+options.backend.client_resources.num_cpus = 8
+options.backend.client_resources.num_gpus = 1
+
+# ------------------------------------------------------------
+# 远程联邦（通过 SuperLink）
+# ------------------------------------------------------------
+[tool.flwr.federations.remote-federation]
+address = "<SUPERLINK-ADDRESS>:<PORT>"
+insecure = true                      # 测试环境下不启用 TLS
+# root-certificates = "<PATH/TO/ca.crt>"   # 如果需要启用 TLS，请配置根证书
+
+# ------------------------------------------------------------
+# 本地部署模式（非模拟）
+# ------------------------------------------------------------
+[tool.flwr.federations.local-deployment]
+address = "127.0.0.1:9093"
+insecure = true
+
+# IID 种子设置
+
+[tool.flwr.app.iid.pi0_libero_0813_fl]
+split_seed = 42
+
+# ------------------------------------------------------------
+# 非 IID 数据集映射（可选）
+# 说明：当使用 non-IID 客户端 scripts.federated_disk.client_flwr_disk_noniid:app 时，
+# 会从此处读取当前 config-name 对应的每个 client 的数据源 repo_id，并覆盖 TrainConfig.data.repo_id。
+# 仅在使用 non-IID 客户端时生效；对于现有 IID 客户端不产生影响。
+#
+# 使用方式：将 [tool.flwr.app.components].clientapp 修改为
+#   "scripts.federated_disk.client_flwr_disk_noniid:app"
+# 然后在下面为对应的 config-name 填写每个客户端的 repo_id。
+#
+# 你稍后可补充真实的 6 个数据集路径。
+[tool.flwr.app.noniid]
+
+# 示例：针对当前 config-name = "pi0_libero_0813_fl"
+[tool.flwr.app.noniid.pi0_libero_0813_fl]
+# 按 client_id 顺序给出，每个元素对应一个客户端
+repo_id_by_client = [
+    "hw3579/libero_banana_state_7_crop",          # client 0
+    "hw3579/libero_blue_hammer_state_7_crop",     # client 1
+    "hw3579/libero_blue_squash_ball_state_7_crop",# client 2
+    "hw3579/libero_gray_spanner_state_7_crop",    # client 3
+    "hw3579/libero_lemon_state_7_crop",           # client 4
+    "hw3579/libero_white_baseball_state_7_crop",  # client 5
+]

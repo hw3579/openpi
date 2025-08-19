@@ -74,6 +74,9 @@ class Pi0Config(_model.BaseModelConfig):
     action_dim: int = 32
     action_horizon: int = 50
     max_token_len: int = 48
+    
+    # 新增：动作维度权重，用于加权损失计算
+    action_weights: tuple[float, ...] | None = None
 
     @property
     @override
@@ -144,6 +147,9 @@ class Pi0Config(_model.BaseModelConfig):
 class Pi0(_model.BaseModel):
     def __init__(self, config: Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        # 保存配置引用以便在其他方法中使用
+        self.config = config
+        
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -263,7 +269,32 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        # 原来的损失函数（注释掉）
+        # return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        
+        # 新增：支持加权损失的计算
+        loss = jnp.square(v_t - u_t)
+        # for i in range(len(loss.shape) - 1):
+        #     jax.debug.print("u_t[{}][0] = {}", i, u_t[i][0])
+
+        # 如果配置了动作权重，应用加权损失
+        if hasattr(self.config, 'action_weights') and self.config.action_weights is not None:
+            action_weights = jnp.array(self.config.action_weights, dtype=loss.dtype)
+            # 确保权重维度匹配
+            if action_weights.shape[0] >= loss.shape[-1]:
+                action_weights = action_weights[:loss.shape[-1]]
+            else:
+                # 如果权重不够，用1.0填充
+                padding = jnp.ones(loss.shape[-1] - action_weights.shape[0], dtype=loss.dtype)
+                action_weights = jnp.concatenate([action_weights, padding])
+            
+            # 应用权重，广播到所有批次和时间维度
+            weights_broadcasted = jnp.broadcast_to(action_weights, loss.shape)
+            loss = loss * weights_broadcasted
+            # from jax import debug
+            # debug.print("weights_broadcasted[0][0] = {}", weights_broadcasted[0][0])
+            # weights_broadcasted[0][0] = [1. 1. 1. 1. 1. 1. 3.]
+        return jnp.mean(loss, axis=-1)
 
     @override
     def sample_actions(

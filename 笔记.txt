@@ -1,0 +1,259 @@
+训练
+
+export CUDA_VISIBLE_DEVICES=1
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_franka_h5_lora_banana --exp-name=h5 --resume
+
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_franka_h5_lora --exp-name=h5 --resume
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_hf_banana --exp-name=h5 --resume
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_lora_hf --exp-name=h5 --resume
+
+计算norm stats
+
+uv run scripts/compute_norm_stats.py --config-name pi0_fast_franka_h5_lora
+
+uv run scripts/compute_norm_stats.py --config-name pi0_fast_franka_h5_lora_banana
+
+uv run scripts/compute_norm_stats.py --config-name pi0_fast_libero_lora_hf
+
+
+开启服务器 还没测
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_franka_h5_lora --policy.dir=checkpoints/pi0_fast_franka_h5_lora/all/29999
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_franka_h5_lora_banana --policy.dir=checkpoints/pi0_fast_franka_h5_lora_banana/h5/25000
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_franka_h5_lora_banana --policy.dir=checkpoints/pi0_fast_franka_h5_lora_banana/fintune_libero/3000
+
+
+主要修改的点 在training/dataloader.py下面  create_data_loader
+
+    dataset = create_dataset(data_config, config.model)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    对dataset函数动手 让repoid为custom 手动接入外部导入数据集
+
+7.12 
+发现franka的0Tee是column-major的 数据不对
+
+运行命令
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_libero_lora_hf_banana --policy.dir=checkpoints/pi0_fast_libero_lora_hf_banana/h5/29999
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_libero_lora_hf --policy.dir=checkpoints/pi0_fast_libero_lora_hf/h5/29999
+
+
+7.18
+
+uv run scripts/compute_norm_stats.py --config-name pi0_fast_libero_lora_hf_crop
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_lora_hf_crop --exp-name=crop --resume
+
+----------------------------------
+
+crop 范围 [100:720, 200:1000]
+
+export CUDA_VISIBLE_DEVICES=1
+
+uv run scripts/compute_norm_stats.py --config-name pi0_fast_libero_lora_hf_crop_banana
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_lora_hf_crop_banana --exp-name=banana_crop --resume
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_libero_lora_hf_crop --policy.dir=checkpoints/pi0_fast_libero_lora_hf_crop/crop/23000
+
+
+
+-------------------------------------------
+7.19
+
+geneva:
+uv run scripts/compute_norm_stats.py --config-name pi0_fast_libero_hf_crop
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_hf_crop --exp-name=crop --resume
+
+储存不够
+uv run scripts/compute_norm_stats.py --config-name pi0_fast_libero_hf_crop_banana
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_hf_crop_banana --exp-name=crop --resume
+
+################
+回到这台机器
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_lora_hf_crop_banana --exp-name=crop_action_10 --resume
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_lora_hf_crop --exp-name=crop_action_10 --resume
+
+---pi0 fast
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_libero_lora_hf_crop --policy.dir=checkpoints/pi0_fast_libero_lora_hf_crop/crop_action_10/29999
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_libero_lora_hf_crop_banana --policy.dir=checkpoints/pi0_fast_libero_lora_hf_crop_banana/crop_action_10/29999
+
+-------------------------------------------
+7.20 测试pi0 -转7维度 数据集为7维改为
+
+pi0_libero_lora_hf_crop_banana
+
+uv run scripts/compute_norm_stats.py --config-name pi0_libero_lora_hf_crop_banana
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_lora_hf_crop_banana --exp-name=crop_action_10 --resume
+
+
+pi0_libero_lora_hf_crop
+
+uv run scripts/compute_norm_stats.py --config-name pi0_libero_lora_hf_crop
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_lora_hf_crop --exp-name=crop_action_10 --resume
+
+
+-----------test---------
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_lora_hf_crop_banana --policy.dir=checkpoints/pi0_libero_lora_hf_crop_banana/crop_action_10/29999
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_lora_hf_crop --policy.dir=checkpoints/pi0_libero_lora_hf_crop/crop_action_10/29999
+
+
+------------------7.24 重新训练pi0fast pi0 快照版本------
+
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_lora_hf_crop_banana --exp-name=snapshot250724_crop_action_10 --resume 
+# 输入尝试使用state7? 注意这里改为了state7的
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_lora_hf_crop_banana --exp-name=snapshot250724_crop_action_10 --resume
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_lora_hf_crop_banana --policy.dir=checkpoints/pi0_libero_lora_hf_crop_banana/snapshot250724_crop_action_10/29000
+
+------尝试使用消融实验 输入robotstate都是0-----------
+
+uv run scripts/compute_norm_stats.py --config-name pi0_libero_lora_hf_crop_banana_zero_robotstate
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_lora_hf_crop_banana --exp-name=snapshot250726_zero_robotstate --resume
+
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_lora_hf_crop_banana_zero_robotstate --exp-name=snapshot250726_zero_robotstate --resume
+
+
+############0728的测试
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_lora_hf_crop_banana_zero_robotstate --policy.dir=checkpoints/pi0_libero_lora_hf_crop_banana_zero_robotstate/snapshot250726_zero_robotstate/29999
+
+
+###########0729 pi0_fast
+
+pi0_fast_libero_lora_hf_crop_banana_zero_robotstate
+
+uv run scripts/compute_norm_stats.py --config-name pi0_fast_libero_lora_hf_crop_banana_zero_robotstate
+
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_lora_hf_crop_banana_zero_robotstate --exp-name=snapshot250729_pi0fast_zero_robotstate --resume
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_libero_lora_hf_crop_banana_zero_robotstate --policy.dir=checkpoints/pi0_fast_libero_lora_hf_crop_banana_zero_robotstate/snapshot250729_pi0fast_zero_robotstate/26000
+
+
+#######################
+0801 测试pi0 数据增强版
+
+pi0_libero_0801_aug
+
+uv run scripts/compute_norm_stats.py --config-name pi0_libero_0801_aug
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_0801_aug --exp-name=aug --resume
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_0801_aug --policy.dir=checkpoints/pi0_libero_0801_aug/aug/20000
+
+
+#########
+0802 夹爪权重不够
+
+pi0_libero_0801_aug_gripper_weighted
+
+uv run scripts/compute_norm_stats.py --config-name pi0_libero_0801_aug_gripper_weighted
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_0801_aug_gripper_weighted --exp-name=aug_gripper_weighted --resume
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_0801_aug_gripper_weighted --policy.dir=checkpoints/pi0_libero_0801_aug_gripper_weighted/aug_gripper_weighted/29999
+
+
+#############
+不加数据增强的版本 对比实验
+pi0_libero_0803
+
+uv run scripts/compute_norm_stats.py --config-name pi0_libero_0803
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_0803 --exp-name=no_aug --resume
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_0803 --policy.dir=checkpoints/pi0_libero_0803/no_aug/29999
+
+#############
+加上带上数据增强的版本
+pi0_libero_0801_aug
+
+uv run scripts/compute_norm_stats.py --config-name pi0_libero_0801_aug
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_0801_aug --exp-name=0803_aug --resume
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_0801_aug --policy.dir=checkpoints/pi0_libero_0801_aug/0803_aug/29999
+
+############## 0804 增加一个全部数据集的 带上数据增强 这个模型为旗舰模型
+
+pi0_libero_0804_aug_all
+
+uv run scripts/compute_norm_stats.py --config-name pi0_libero_0804_aug_all
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_libero_0804_aug_all --exp-name=0804_aug_all --resume
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_0804_aug_all --policy.dir=checkpoints/pi0_libero_0804_aug_all/0804_aug_all/29999
+
+
+然后 增加pi0fast的banana aug版本
+pi0_fast_libero_0804_aug_banana
+
+uv run scripts/compute_norm_stats.py --config-name pi0_fast_libero_0804_aug_banana
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi0_fast_libero_0804_aug_banana --exp-name=0804_aug_banana --resume
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_fast_libero_0804_aug_banana --policy.dir=checkpoints/pi0_fast_libero_0804_aug_banana/0804_aug_banana/29999
+
+
+####################
+20250813 测试进行FL的测试
+
+uv run scripts/compute_norm_stats.py --config-name pi0_libero_0813_fl
+
+uv run scripts/federated/server_flwr_simple.py --address 0.0.0.0:9090 --rounds 2 --min-fit-clients 1 --fraction-fit 1.0 --min-available-clients 1
+
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
+export JAX_TRACEBACK_FILTERING=off
+
+uv run scripts/federated/client_flwr.py --server-address 0.0.0.0:9090 --config-name pi0_libero_0813_fl --exp-name flwr --total-clients 1 --client-id 0 --virtual-clients 1 --local-steps 1 --batch-size 16 --fsdp-devices 1 --num-workers 2
+
+
+############# 20250814 新框架
+
+uv run flower-superlink --insecure
+
+uv run flower-supernode --insecure --superlink 127.0.0.1:9092 --clientappio-api-address 127.0.0.1:9094
+
+uv run flower-supernode --insecure --superlink 127.0.0.1:9092 --clientappio-api-address 127.0.0.1:9095 #2
+
+uv run flwr run . local-deployment --stream 
+
+# simulation
+
+export CUDA_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
+uv run flwr run . local-simulation --stream
+
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_0813_fl --policy.dir=checkpoints/pi0_libero_0813_fl/flwr/1
+
+
+
+###############20250817
+6客户端
+1000每个客户端
+10次迭代
+
+export CUDA_VISIBLE_DEVICES=1
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi0_libero_0813_fl --policy.dir=checkpoints/pi0_libero_0813_fl/flwr_iid_0817/16
+

@@ -81,13 +81,23 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig) -> Dataset:
+# def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig) -> Dataset:
+def create_dataset(data_config, model_config ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if repo_id == "custom":
+        # 检查是否是Franka H5数据配置
+        if hasattr(data_config, 'data_dir') and hasattr(data_config, 'image_key'):
+            # from openpi.extern.franka_h5_pipeline import FrankaH5Dataset
+            from openpi.extern.franka_custom_dataset import FrankaH5Dataset
+            franka = FrankaH5Dataset(model_config, data_config)
+            return franka
+        else:
+            raise ValueError(f"unknow: {data_config}")
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
@@ -153,6 +163,11 @@ def create_data_loader(
 
     dataset = create_dataset(data_config, config.model)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    # dataset = transform_dataset(
+    #     dataset,
+    #     data_config,
+    #     skip_norm_stats=True,
+    # )
 
     data_loader = TorchDataLoader(
         dataset,

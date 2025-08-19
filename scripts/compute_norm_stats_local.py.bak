@@ -1,0 +1,174 @@
+"""计算本地数据集的规范化统计数据。
+
+此脚本用于计算本地数据集的规范化统计数据，专为本地Bridge数据集设计。
+与标准compute_norm_stats.py的区别在于支持本地数据集的流式加载和内存优化。
+"""
+
+import logging
+import pathlib
+from typing import Dict, Optional, Tuple, Any
+
+import numpy as np
+import tqdm
+import tyro
+import torch
+
+import openpi.shared.normalize as _normalize
+import openpi.training.local_dataset_config as _config
+import openpi.training.data_loader as _data_loader
+import openpi.transforms as transforms
+
+# 设置日志格式与原版保持一致
+logger = logging.getLogger("openpi")
+
+class RemoveStrings(transforms.DataTransformFn):
+    """移除字符串字段的转换器，与原版功能相同。"""
+    def __call__(self, x: dict) -> dict:
+        return {k: v for k, v in x.items() if not isinstance(v, str)}
+
+def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _data_loader.Dataset]:
+    """创建数据集，支持本地数据集和标准数据集。
+    
+    Args:
+        config: 训练配置
+        
+    Returns:
+        数据配置和数据集元组
+    """
+    # 获取数据配置工厂
+    factory = config.data
+    
+    # 检查是否为本地数据集
+    is_local_dataset = hasattr(factory, 'get_dataset') or hasattr(factory, 'get_dataloader')
+    
+    # 创建数据配置
+    data_config = factory.create(config.assets_dirs, config.model)
+    
+    # 处理repo_id（与原版逻辑保持一致）
+    if data_config.repo_id is None:
+        if is_local_dataset:
+            # 为本地数据集生成临时repo_id
+            model_name = config.model.__class__.__name__
+            dataset_name = getattr(factory, 'dataset_name', 'local_dataset')
+            temp_repo_id = f"local_{model_name}_{dataset_name}"
+            logger.info(f"为本地数据集设置临时repo_id: {temp_repo_id}")
+            
+            import dataclasses
+            data_config = dataclasses.replace(data_config, repo_id=temp_repo_id)
+        else:
+            raise ValueError("Data config must have a repo_id")
+    
+    # 创建数据集
+    if is_local_dataset:
+        logger.info("使用本地数据集配置")
+        
+        # 优先使用get_dataset方法
+        if hasattr(factory, 'get_dataset'):
+            raw_dataset = factory.get_dataset()
+            logger.info("通过get_dataset()获取本地数据集")
+        else:
+            # 备选：使用get_dataloader方法
+            raw_dataloader = factory.get_dataloader()
+            logger.info("通过get_dataloader()获取本地数据集")
+            
+            # 将DataLoader适配为Dataset
+            class DataLoaderDataset(_data_loader.Dataset):
+                def __init__(self, dataloader):
+                    self.dataloader = dataloader
+                    self._iterator = None
+                    self._cache = []
+                
+                def __iter__(self):
+                    for batch in self.dataloader:
+                        # 展开批次为单个样本
+                        batch_size = len(next(iter(batch.values())))
+                        for i in range(batch_size):
+                            yield {k: v[i] if hasattr(v, '__getitem__') and len(v) > i else v 
+                                  for k, v in batch.items()}
+                
+                def __len__(self):
+                    return getattr(self.dataloader.dataset, '__len__', lambda: 1000)()
+            
+            raw_dataset = DataLoaderDataset(raw_dataloader)
+        
+        # 应用转换（与原版逻辑相同）
+        dataset = _data_loader.TransformedDataset(
+            raw_dataset,
+            [
+                *data_config.repack_transforms.inputs,
+                *data_config.data_transforms.inputs,
+                RemoveStrings(),
+            ],
+        )
+    else:
+        # 标准数据集处理（与原版完全相同）
+        logger.info("使用标准数据集配置")
+        dataset = _data_loader.create_dataset(data_config, config.model)
+        dataset = _data_loader.TransformedDataset(
+            dataset,
+            [
+                *data_config.repack_transforms.inputs,
+                *data_config.data_transforms.inputs,
+                RemoveStrings(),
+            ],
+        )
+    
+    return data_config, dataset
+
+def main(config_name: str, max_frames: int | None = None):
+    """主函数，与原版接口保持一致。
+    
+    Args:
+        config_name: 配置名称
+        max_frames: 最大处理帧数，默认为1000
+    """
+    # 加载配置
+    config = _config.get_config(config_name)
+    data_config, dataset = create_dataset(config)
+    
+    logger.info("加载规范化统计处理工具...")
+    normalizer = _normalize.load(config.assets_dirs / data_config.repo_id)
+    
+    # 创建数据加载器，处理本地数据集的特殊情况
+    if hasattr(dataset, '__iter__') and not hasattr(dataset, '__getitem__'):
+        # 对于纯迭代数据集，直接迭代
+        logger.info("检测到迭代数据集，使用直接迭代模式")
+        data_iter = iter(dataset)
+        num_frames = max_frames or 1000
+        
+        logger.info("开始计算统计数据...")
+        for i in tqdm.tqdm(range(num_frames), desc="Computing stats"):
+            try:
+                batch = next(data_iter)
+                normalizer.update(batch)
+            except StopIteration:
+                logger.info(f"数据集迭代完成，共处理 {i} 个样本")
+                break
+    else:
+        # 标准数据加载器模式（与原版相同）
+        logger.info("使用标准DataLoader模式")
+        data_loader = _data_loader.DataLoader(
+            dataset,
+            batch_size=1,
+            num_workers=0,  # 本地数据集使用单进程避免序列化问题
+            shuffle=True,
+        )
+        
+        num_frames = max_frames or 1000
+        logger.info("开始计算统计数据...")
+        
+        frame_count = 0
+        for batch in tqdm.tqdm(data_loader, total=num_frames, desc="Computing stats"):
+            normalizer.update(batch)
+            frame_count += 1
+            if frame_count >= num_frames:
+                break
+    
+    # 保存统计数据（与原版完全相同）
+    logger.info(f"写入统计数据到: {config.assets_dirs / data_config.repo_id}")
+    normalizer.save()
+    
+    logger.info("规范化统计数据计算完成")
+
+if __name__ == "__main__":
+    tyro.cli(main)

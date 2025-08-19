@@ -1,5 +1,5 @@
 """See _CONFIGS for the list of available configs."""
-
+from __future__ import annotations
 import abc
 from collections.abc import Sequence
 import dataclasses
@@ -25,6 +25,9 @@ import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+
+# 首先需要在文件顶部导入Pi0FrankaConfig
+import openpi.models.pi0_franka as pi0_franka
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -317,6 +320,75 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoDataConfigWithAug(LeRobotLiberoDataConfig):
+    """
+    Extended Libero data configuration with image augmentation support.
+    
+    This config adds comprehensive image augmentation capabilities to the base
+    Libero configuration to improve model robustness and generalization.
+    """
+    
+    # Whether to enable image augmentation
+    enable_image_aug: bool = True
+    
+    # Augmentation probability (0.0 to 1.0)
+    aug_prob: float = 0.8
+    
+    # Random resized crop parameters
+    crop_scale: tuple[float, float] = (0.9, 0.9)
+    crop_ratio: tuple[float, float] = (1.0, 1.0)
+    
+    # Color augmentation parameters
+    brightness_range: float = 0.2
+    contrast_range: tuple[float, float] = (0.8, 1.2)
+    saturation_range: tuple[float, float] = (0.8, 1.2)
+    hue_range: float = 0.05
+    
+    # Augmentation execution order
+    aug_order: tuple[str, ...] = (
+        "random_resized_crop", "random_brightness", "random_contrast", 
+        "random_saturation", "random_hue"
+    )
+    
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Get base configuration
+        base_config = super().create(assets_dirs, model_config)
+        
+        if not self.enable_image_aug:
+            return base_config
+            
+        # Import augmentation transform
+        from openpi.augmentation import ImageAugmentation
+        
+        # Create image augmentation transform with specified parameters
+        image_aug_transform = ImageAugmentation(
+            random_resized_crop={
+                "scale": list(self.crop_scale), 
+                "ratio": list(self.crop_ratio)
+            },
+            random_brightness=[self.brightness_range],
+            random_contrast=list(self.contrast_range),
+            random_saturation=list(self.saturation_range),
+            random_hue=[self.hue_range],
+            augment_order=list(self.aug_order),
+            augment_prob=self.aug_prob,
+        )
+        
+        # Insert image augmentation at the beginning of data transforms
+        # This ensures augmentation happens early in the pipeline, before normalization
+        enhanced_data_transforms = _transforms.Group(
+            inputs=[image_aug_transform] + list(base_config.data_transforms.inputs),
+            outputs=base_config.data_transforms.outputs
+        )
+        
+        return dataclasses.replace(
+            base_config,
+            data_transforms=enhanced_data_transforms
         )
 
 
@@ -633,6 +705,458 @@ _CONFIGS = [
         exp_name="debug",
         num_train_steps=10,
         wandb_enabled=False,
+    ),
+
+
+
+    TrainConfig(
+        name="pi0_fast_libero_hf_banana",
+        # Here is an example of loading a pi0-FAST model for full finetuning.
+        # Modify action_dim and action_horizon to match your dataset (action horizon is equal to
+        # the desired action chunk length).
+        # The max_token_len is the maximum number of (non-image) tokens the model can handle.
+        # This includes the tokenized prompt, proprioceptive state, and (FAST-tokenized) action tokens.
+        # Choosing this value too small may chop off tokens at the end of your sequence (the code will throw
+        # a warning), while choosing it too large will waste memory (since we pad each batch element to the
+        # max_token_len). A good rule of thumb is to use approx 180 for single-arm robots, and approx 250 for
+        # two-arm robots. Generally, err on the lower side here first, and potentially increase the value if
+        # you see many warnings being thrown during training.
+        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/franka_h5_flatten",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        # Note that we load the pi0-FAST base model checkpoint here.
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+    ),
+        TrainConfig(
+        name="pi0_fast_libero_lora_hf_banana",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=1, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/franka_h5_flatten",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        # Again, make sure to match the model config above when extracting the freeze filter
+        # that specifies which parameters should be frozen during LoRA finetuning.
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=1, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size=5,
+    ),
+    TrainConfig(
+        name="pi0_fast_libero_lora_hf",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=1, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/franka_h5_all",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        # Again, make sure to match the model config above when extracting the freeze filter
+        # that specifies which parameters should be frozen during LoRA finetuning.
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=1, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size=5,
+    ),
+        TrainConfig(
+        name="pi0_fast_libero_lora_hf_crop",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/libero_all_crop",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        # Again, make sure to match the model config above when extracting the freeze filter
+        # that specifies which parameters should be frozen during LoRA finetuning.
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size=16,
+    ),
+        TrainConfig(
+        name="pi0_fast_libero_lora_hf_crop_banana",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/libero_banana_crop",
+            # repo_id="hw3579/libero_banana_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        # Again, make sure to match the model config above when extracting the freeze filter
+        # that specifies which parameters should be frozen during LoRA finetuning.
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size=16,
+    ),
+    TrainConfig(
+        name="pi0_libero_lora_hf_crop_banana",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        action_dim=7, 
+        action_horizon=10, 
+        max_token_len=180),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/libero_banana_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"
+        , skip_patterns=("action_in_proj",)),                        
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0.Pi0Config(
+        paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        action_dim=7,
+        action_horizon=10,
+        max_token_len=180
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+
+    # 说明 这里的action_dim=7会报错，我们数据集的action_dim是8 输出的action是7 pi0用不了 但是pi0fast可以用？ 现在更换数据集 使用state=7的数据集
+
+    TrainConfig(
+        name="pi0_libero_lora_hf_crop",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        action_dim=7, 
+        action_horizon=10, 
+        max_token_len=180),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/libero_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"
+        , skip_patterns=("action_in_proj",)),                        
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0.Pi0Config(
+        paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        action_dim=7,
+        action_horizon=10,
+        max_token_len=180
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+        TrainConfig(
+        name="pi0_libero_lora_hf_crop_banana_zero_robotstate",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        action_dim=7, 
+        action_horizon=10, 
+        max_token_len=180),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/libero_banana_state_7_crop_zero_robotstate",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"
+        , skip_patterns=("action_in_proj",)),                        
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0.Pi0Config(
+        paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        action_dim=7,
+        action_horizon=10,
+        max_token_len=180
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_fast_libero_lora_hf_crop_banana_zero_robotstate",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/libero_banana_state_7_crop_zero_robotstate",
+            # repo_id="hw3579/libero_banana_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        # Again, make sure to match the model config above when extracting the freeze filter
+        # that specifies which parameters should be frozen during LoRA finetuning.
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size=16,
+    ),
+
+
+    ###############################
+    # 2025.8.2 增加数据增强
+    ##################################
+        # Example configuration with data augmentation
+    TrainConfig(
+        name="pi0_libero_0801_aug",
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7, 
+            action_horizon=10, 
+            max_token_len=180
+        ),
+        # Using the augmented data configuration
+        data=LeRobotLiberoDataConfigWithAug(
+            repo_id="hw3579/libero_banana_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+            # Augmentation parameters
+            enable_image_aug=True,
+            aug_prob=0.8,
+            brightness_range=0.2,
+            contrast_range=(0.8, 1.2),
+            saturation_range=(0.8, 1.2),
+            hue_range=0.05,
+            crop_scale=(0.9, 0.9),
+            crop_ratio=(1.0, 1.0),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_base/params", 
+            skip_patterns=("action_in_proj",)
+        ),                        
+        num_train_steps=30_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=16,
+    ),
+
+    #### 增加夹爪权重的模型配置
+    TrainConfig(
+        name="pi0_libero_0801_aug_gripper_weighted",
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7, 
+            action_horizon=10, 
+            max_token_len=180,
+            # 为7维动作空间设置权重：前6个关节权重1.0，夹爪权重3.0
+            action_weights=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0)
+        ),
+        # Using the augmented data configuration with weighted loss
+        data=LeRobotLiberoDataConfigWithAug(
+            repo_id="hw3579/libero_banana_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+            # Augmentation parameters
+            enable_image_aug=True,
+            aug_prob=0.8,
+            brightness_range=0.2,
+            contrast_range=(0.8, 1.2),
+            saturation_range=(0.8, 1.2),
+            hue_range=0.05,
+            crop_scale=(0.9, 0.9),
+            crop_ratio=(1.0, 1.0),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_base/params", 
+            skip_patterns=("action_in_proj",)
+        ),                        
+        num_train_steps=30_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            action_weights=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0)
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=16,
+    ),
+
+    # 不加数据增强的版本 对比实验
+    TrainConfig(
+        name="pi0_libero_0803",
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7, 
+            action_horizon=10, 
+            max_token_len=180
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="hw3579/libero_banana_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_base/params", 
+            skip_patterns=("action_in_proj",)
+        ),                        
+        num_train_steps=30_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=16,
+    ),
+    ### 0804 增加一个全部数据集的 带上数据增强
+    TrainConfig(
+        name="pi0_libero_0804_aug_all",
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7, 
+            action_horizon=10, 
+            max_token_len=180
+        ),
+        # Using the augmented data configuration
+        data=LeRobotLiberoDataConfigWithAug(
+            repo_id="hw3579/libero_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+            # Augmentation parameters
+            enable_image_aug=True,
+            aug_prob=0.8,
+            brightness_range=0.2,
+            contrast_range=(0.8, 1.2),
+            saturation_range=(0.8, 1.2),
+            hue_range=0.05,
+            crop_scale=(0.9, 0.9),
+            crop_ratio=(1.0, 1.0),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_base/params", 
+            skip_patterns=("action_in_proj",)
+        ),                        
+        num_train_steps=30_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=16,
+    ),
+    ######### 然后增加一个pi0fast的banana aug版本
+    TrainConfig(
+        name="pi0_fast_libero_0804_aug_banana",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ),
+        data=LeRobotLiberoDataConfigWithAug(
+            repo_id="hw3579/libero_banana_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+            # Augmentation parameters
+            enable_image_aug=True,
+            aug_prob=0.8,
+            brightness_range=0.2,
+            contrast_range=(0.8, 1.2),
+            saturation_range=(0.8, 1.2),
+            hue_range=0.05,
+            crop_scale=(0.9, 0.9),
+            crop_ratio=(1.0, 1.0),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        # Again, make sure to match the model config above when extracting the freeze filter
+        # that specifies which parameters should be frozen during LoRA finetuning.
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size=16,
+    ),
+######################
+#0813 测试进行FL的测试
+###########################
+    TrainConfig(
+        name="pi0_libero_0813_fl",
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7, 
+            action_horizon=10, 
+            max_token_len=180
+        ),
+        # Using the augmented data configuration
+        data=LeRobotLiberoDataConfigWithAug(
+            repo_id="hw3579/libero_lemon_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+            # Augmentation parameters
+            enable_image_aug=True,
+            aug_prob=0.8,
+            brightness_range=0.2,
+            contrast_range=(0.8, 1.2),
+            saturation_range=(0.8, 1.2),
+            hue_range=0.05,
+            crop_scale=(0.9, 0.9),
+            crop_ratio=(1.0, 1.0),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_base/params", 
+            skip_patterns=("action_in_proj",)
+        ),                        
+        num_train_steps=30_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=16,
     ),
 ]
 

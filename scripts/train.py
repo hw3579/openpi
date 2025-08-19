@@ -251,6 +251,11 @@ def main(config: _config.TrainConfig):
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
+            
+####################################
+            # from extern.check_sanity import check_sanity
+            # check_sanity(batch)  # 检查批次数据的完整性和正确性
+####################################
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
