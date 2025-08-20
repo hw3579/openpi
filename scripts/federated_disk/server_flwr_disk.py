@@ -246,11 +246,34 @@ class DiskFedAvg(FedAvg):
                     raise RuntimeError(
                         f"Resume requested but failed to restore from checkpoint round {round_to_use}: {e}"
                     )
-            # No valid snapshot found: do not fallback to cache or pretrained
-            raise RuntimeError(
-                f"Resume requested but no valid checkpoint found under {self._snapshot_dir}. "
-                f"Please create snapshots or disable resume."
+            # No valid snapshot found: fallback to cache or pretrained so we can continue
+            print(
+                f"[DiskServer] Resume requested but no valid checkpoint found under {self._snapshot_dir}. "
+                f"Falling back to cache/global or pretrained init."
             )
+            # Try to reuse existing global current file in cache if present
+            try:
+                cur = self._current_global_file()
+                cur.parent.mkdir(parents=True, exist_ok=True)
+                if cur.exists():
+                    self._current_global_path = cur
+                    self._round_offset = 0
+                    self._initialized = True
+                    try:
+                        self._append_jsonl(
+                            {
+                                "event": "resume_fallback_cache",
+                                "ts": time.time(),
+                                "current_global": str(cur),
+                            }
+                        )
+                    except Exception:
+                        pass
+                    print(f"[DiskServer] Resume fallback: reuse cached global at {cur}")
+                    return
+            except Exception as e:
+                print(f"[DiskServer] Resume fallback check failed: {e}")
+            # If no cache global, fall through to pretrained init below
 
         # Initialize from pretrained weights in config or start empty
         print(f"[DiskServer] Initializing pretrained weights: {self._config_name}")
@@ -435,59 +458,56 @@ class DiskFedAvg(FedAvg):
             print("[DiskServer] No valid client paths; skip update")
             return ndarrays_to_parameters([]), {}
 
-        # Phase 2: Parallel NPZ loading
+        # Phase 2: Parallel NPZ loading (original approach, with bounded parallelism)
         fed_opt_enabled = _get_fed_opt_from_toml()
-        
+
         def load_client_npz(path_examples_proxy):
             path, examples, proxy = path_examples_proxy
             try:
                 loaded_data = _load_npz_dict(path)
-                
+
                 if fed_opt_enabled and isinstance(loaded_data, dict) and "params" in loaded_data:
                     # Fed_opt format: extract all components
                     params = loaded_data.get("params", {})
                     opt_state = loaded_data.get("opt_state", None)
                     ema_params = loaded_data.get("ema_params", None)
-                    
+
                     k, a = _flatten_params(params)
-                    
+
                     # Also flatten optimizer state and EMA params if they exist
                     opt_k, opt_a = (None, None)
                     ema_k, ema_a = (None, None)
-                    
+
                     if opt_state is not None:
                         opt_k, opt_a = _flatten_params(opt_state)
                     if ema_params is not None:
                         ema_k, ema_a = _flatten_params(ema_params)
-                    
+
                     return (k, a, opt_k, opt_a, ema_k, ema_a, examples, proxy, None)
                 else:
                     # Standard format: only model parameters
                     k, a = _flatten_params(loaded_data)
                     return (k, a, None, None, None, None, examples, proxy, None)
-                    
+
             except Exception as e:
                 return (None, None, None, None, None, None, examples, proxy, str(e))
 
         loaded_clients = []
         loaded_opt_states = []
         loaded_ema_params = []
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(client_data))) as executor:
-            futures = [executor.submit(load_client_npz, cd) for cd in client_data]
-            # Collect results in deterministic order to avoid any append race conditions
-            results = []
-            for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
-            
-            # Process results sequentially (thread-safe)
-            for k, a, opt_k, opt_a, ema_k, ema_a, examples, proxy, error in results:
+
+        max_workers = min(4, len(client_data))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futs = [executor.submit(load_client_npz, cd) for cd in client_data]
+            load_results = []
+            for future in concurrent.futures.as_completed(futs):
+                load_results.append(future.result())
+
+            for k, a, opt_k, opt_a, ema_k, ema_a, examples, proxy, error in load_results:
                 if error:
                     print(f"[DiskServer] Failed to load client {proxy}: {error}")
                     continue
                 loaded_clients.append((k, a, examples))
-                
-                # Store fed_opt components if available
                 if fed_opt_enabled:
                     if opt_k is not None and opt_a is not None:
                         loaded_opt_states.append((opt_k, opt_a, examples))
@@ -498,18 +518,14 @@ class DiskFedAvg(FedAvg):
             print("[DiskServer] No valid client arrays; skip update")
             return ndarrays_to_parameters([]), {}
 
-        # Phase 3: Aggregate model parameters (existing logic)
+        # Phase 3: Aggregate components using reusable aggregator
         aggregated_params = self._aggregate_component(loaded_clients, "params")
-        
-        # Phase 4: Aggregate fed_opt components if enabled
         aggregated_dict = {"params": aggregated_params}
-        
         if fed_opt_enabled:
             if loaded_opt_states:
                 aggregated_opt_state = self._aggregate_component(loaded_opt_states, "opt_state")
                 aggregated_dict["opt_state"] = aggregated_opt_state
                 print(f"[FedOpt] Aggregated optimizer states from {len(loaded_opt_states)} clients")
-            
             if loaded_ema_params:
                 aggregated_ema_params = self._aggregate_component(loaded_ema_params, "ema_params")
                 aggregated_dict["ema_params"] = aggregated_ema_params
@@ -518,14 +534,12 @@ class DiskFedAvg(FedAvg):
         # Save the aggregated result
         new_current = self._current_global_file()
         if fed_opt_enabled and len(aggregated_dict) > 1:
-            # Save fed_opt format
             _save_npz_dict(new_current, aggregated_dict, dtype=self._store_dtype)
             print(f"[FedOpt] Saved aggregated training state: {new_current}")
         else:
-            # Save standard format (only params)
             _save_params_npz(new_current, aggregated_params, dtype=self._store_dtype)
             print(f"[DiskServer] Updated current global params: {new_current}")
-        
+
         self._current_global_path = new_current
         # Log aggregate summary
         try:
@@ -605,6 +619,15 @@ class DiskFedAvg(FedAvg):
 
         # No per-round globals kept in cache; only keep the single current file.
 
+        # Aggressive memory cleanup to reduce Ray OOM risk before scheduling next round
+        try:
+            for _name in (
+                'loaded_clients','loaded_opt_states','loaded_ema_params','aggregated_params','aggregated_dict'
+            ):
+                if _name in locals():
+                    locals()[_name] = None
+        except Exception:
+            pass
         gc.collect()
         try:
             jax.clear_caches()

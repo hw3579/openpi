@@ -1132,6 +1132,7 @@ _CONFIGS = [
         # Using the augmented data configuration
         data=LeRobotLiberoDataConfigWithAug(
             repo_id="hw3579/libero_state_7_crop",
+            # repo_id="hw3579/libero_blue_squash_ball_state_7_crop",
             base_config=DataConfig(prompt_from_task=True),
             # Augmentation parameters
             enable_image_aug=True,
