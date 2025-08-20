@@ -152,6 +152,32 @@ def _get_split_seed_from_toml(config_name: str) -> int | None:
         return None
 
 
+def _get_fed_opt_from_toml() -> bool:
+    """Read pyproject.toml to check if fed_opt is enabled.
+
+    Returns:
+        True if fed_opt is enabled, False otherwise (default).
+    """
+    pyproj = _ROOT / "pyproject.toml"
+    try:
+        try:
+            import tomllib as _tomllib  # Python 3.11+
+        except Exception:  # pragma: no cover
+            import tomli as _tomllib  # type: ignore
+        with open(pyproj, "rb") as f:
+            data = _tomllib.load(f)
+        config_sec = (
+            data.get("tool", {})
+            .get("flwr", {})
+            .get("app", {})
+            .get("config", {})
+        )
+        return config_sec.get("fed-opt", False)  # Default to False
+    except Exception as e:  # pragma: no cover
+        print(f"[DiskClient] Failed to read fed_opt from TOML: {e}")
+        return False
+
+
 def _build_uniform_indices(n_samples: int, total_clients: int, client_id: int, seed: int) -> list[int]:
     """Uniform partition: random permute by seed, then contiguous split.
 
@@ -177,9 +203,35 @@ def _build_uniform_indices(n_samples: int, total_clients: int, client_id: int, s
 
 
 def _save_params_npz(file_path: pathlib.Path | str, state: training_utils.TrainState, *, dtype: np.dtype) -> str:
-    pure = (state.ema_params or state.params).to_pure_dict()
-    pure = jax.tree.map(lambda x: getattr(x, "value", x), pure)
-    return _save_npz_dict(file_path, pure, dtype=dtype)
+    # Read fed_opt setting from TOML
+    fed_opt_enabled = _get_fed_opt_from_toml()
+    
+    if fed_opt_enabled:
+        # Save full training state (params + opt_state + ema_params)
+        save_dict = {}
+        
+        # Always save model parameters (EMA if available, otherwise regular params)
+        params_pure = (state.ema_params or state.params).to_pure_dict()
+        params_pure = jax.tree.map(lambda x: getattr(x, "value", x), params_pure)
+        save_dict["params"] = params_pure
+        
+        # Save optimizer state
+        if state.opt_state is not None:
+            opt_state_pure = jax.tree.map(lambda x: getattr(x, "value", x), state.opt_state)
+            save_dict["opt_state"] = opt_state_pure
+        
+        # Save EMA parameters if they exist and are different from regular params
+        if state.ema_params is not None:
+            ema_pure = state.ema_params.to_pure_dict()
+            ema_pure = jax.tree.map(lambda x: getattr(x, "value", x), ema_pure)
+            save_dict["ema_params"] = ema_pure
+        
+        return _save_npz_dict(file_path, save_dict, dtype=dtype)
+    else:
+        # Standard mode: only save model parameters
+        pure = (state.ema_params or state.params).to_pure_dict()
+        pure = jax.tree.map(lambda x: getattr(x, "value", x), pure)
+        return _save_npz_dict(file_path, pure, dtype=dtype)
 
 
 def _apply_params_from(path: str, state: training_utils.TrainState) -> training_utils.TrainState:
@@ -189,6 +241,62 @@ def _apply_params_from(path: str, state: training_utils.TrainState) -> training_
         loaded = _load_npz_dict(file)
     else:
         loaded = _model.restore_params(path, restore_type=jax.Array, dtype=None)
+    
+    # Check if this is fed_opt format (contains multiple keys like params, opt_state, ema_params)
+    fed_opt_enabled = _get_fed_opt_from_toml()
+    is_fed_opt_format = (
+        isinstance(loaded, dict) and 
+        any(key in loaded for key in ["params", "opt_state", "ema_params"])
+    )
+    
+    if fed_opt_enabled and is_fed_opt_format:
+        # Fed_opt mode: restore full training state
+        new_state = state
+        
+        # Apply model parameters if present
+        if "params" in loaded:
+            new_state = _apply_model_params(loaded["params"], new_state)
+        
+        # Apply optimizer state if present
+        if "opt_state" in loaded and loaded["opt_state"] is not None:
+            # Validate shape compatibility and apply
+            try:
+                # Simple shape validation for opt_state
+                import jax
+                current_opt_flat = jax.tree_util.tree_flatten(state.opt_state)[0]
+                loaded_opt_flat = jax.tree_util.tree_flatten(loaded["opt_state"])[0]
+                
+                if len(current_opt_flat) == len(loaded_opt_flat):
+                    # Basic check passed, apply optimizer state
+                    new_state = dataclasses.replace(new_state, opt_state=loaded["opt_state"])
+                    print(f"[FedOpt] Applied optimizer state")
+                else:
+                    print(f"[FedOpt] Optimizer state shape mismatch, keeping local state")
+            except Exception as e:
+                print(f"[FedOpt] Failed to apply optimizer state: {e}")
+        
+        # Apply EMA parameters if present
+        if "ema_params" in loaded and loaded["ema_params"] is not None:
+            try:
+                import flax.nnx as nnx
+                # Convert loaded EMA params to proper format
+                model = nnx.merge(new_state.model_def, new_state.params)
+                graphdef, nnx_state = nnx.split(model)
+                nnx_state.replace_by_pure_dict(loaded["ema_params"])
+                ema_params = nnx.state(nnx.merge(graphdef, nnx_state))
+                new_state = dataclasses.replace(new_state, ema_params=ema_params)
+                print(f"[FedOpt] Applied EMA parameters")
+            except Exception as e:
+                print(f"[FedOpt] Failed to apply EMA parameters: {e}")
+        
+        return new_state
+    else:
+        # Standard mode: only apply model parameters
+        return _apply_model_params(loaded, state)
+
+
+def _apply_model_params(loaded: dict, state: training_utils.TrainState) -> training_utils.TrainState:
+    """Apply model parameters to training state (extracted from original _apply_params_from)."""
     import flax.nnx as nnx
     model = nnx.merge(state.model_def, state.params)
     graphdef, nnx_state = nnx.split(model)

@@ -26,7 +26,7 @@ dependencies = [
     "orbax-checkpoint==0.11.13",
     "pillow>=11.0.0",
     "protobuf>=4.21.6,<5.0.0",
-    "flwr>=1.20.0",
+    "flwr[simulation]>=1.20.0",
     "s3fs>=2024.9.0",
     "sentencepiece>=0.2.0",
     "torch>=2.7.0",
@@ -154,8 +154,8 @@ publisher = "flower"
 
 # 当前实际使用的配置（基于 disk）
 serverapp = "scripts.federated_disk.server_flwr_disk:app"
-# clientapp = "scripts.federated_disk.client_flwr_disk:app"
-clientapp = "scripts.federated_disk.client_flwr_disk_noniid:app"
+clientapp = "scripts.federated_disk.client_flwr_disk:app"
+# clientapp = "scripts.federated_disk.client_flwr_disk_noniid:app"
 
 # ------------------------------------------------------------
 # 自定义运行配置，可通过 context.run_config 访问
@@ -178,7 +178,7 @@ max-parallel-clients = 1             # 最大并发客户端数
 
 # 本地训练参数
 local-steps = 1000
-batch-size = 32
+batch-size = 16
 num-workers = 4
 fsdp-devices = 1                     # FSDP 并行设备数
 
@@ -188,11 +188,15 @@ exit-after-fit = true                # 完成一次 fit 后是否退出
 snapshot-interval = 1                # 快照保存间隔（以轮为单位）
 # snapshot-dir = "./checkpoints/pi0_libero_0813_fl"  # 可指定快照目录
 # 快照的实验子目录名（默认 flwr），最终路径为 ./checkpoints/<config-name>/<snapshot-exp>/
-snapshot-exp = "flwr_non_iid_0819"
+# snapshot-exp = "flwr_non_iid_0819_batch32"
+snapshot-exp = "flwr_iid_0820"
 resume = false                       # 是否从快照恢复
 
 # 是否在 cache 中保留每一轮的全局权重（不做保留策略删除）
 keep-all-globals = true              # 新增选项
+
+# 联邦优化器配置
+fed-opt = false                      # 是否启用 fed_opt 进行优化器状态和EMA等全量参数聚合
 
 # 精度设置
 store-precision = "fp32"             # 存储时精度

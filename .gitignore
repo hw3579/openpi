@@ -172,3 +172,5 @@ cython_debug/
 /logs
 /cache
 /.vscode
+*.zip
+*.parquet

@@ -65,6 +65,32 @@ import orbax.checkpoint as ocp  # Only used to read initial checkpoints via _mod
 import flax.nnx as nnx
 
 
+def _get_fed_opt_from_toml() -> bool:
+    """Read pyproject.toml to check if fed_opt is enabled.
+
+    Returns:
+        True if fed_opt is enabled, False otherwise (default).
+    """
+    pyproj = _ROOT / "pyproject.toml"
+    try:
+        try:
+            import tomllib as _tomllib  # Python 3.11+
+        except Exception:  # pragma: no cover
+            import tomli as _tomllib  # type: ignore
+        with open(pyproj, "rb") as f:
+            data = _tomllib.load(f)
+        config_sec = (
+            data.get("tool", {})
+            .get("flwr", {})
+            .get("app", {})
+            .get("config", {})
+        )
+        return config_sec.get("fed-opt", False)  # Default to False
+    except Exception as e:  # pragma: no cover
+        print(f"[DiskServer] Failed to read fed_opt from TOML: {e}")
+        return False
+
+
 class DiskFedAvg(FedAvg):
     """FedAvg variant that exchanges only checkpoint paths.
 
@@ -374,21 +400,23 @@ class DiskFedAvg(FedAvg):
         )
         if not results:
             return None, {}
-        # real_round already computed above
 
-        # Streaming weighted sum
-        acc_arrays: List[np.ndarray] | None = None
-        keys_order: List[Tuple[str, ...]] | None = None
-        total_w = 0.0
+        # Fast aggregation: batch load and parallel processing
+        import concurrent.futures
+        import threading
+        
+        client_data = []  # [(path, examples, client_proxy), ...]
         client_param_paths: List[pathlib.Path] = []
 
+        # Phase 1: Collect paths and examples (fast)
         for client_proxy, fit_res in results:
             metrics: Dict[str, Any] = getattr(fit_res, "metrics", None) or {}
             p = metrics.get("saved_params_path")
             if not p:
                 print(f"[DiskServer] Warning: client {client_proxy} returned no 'saved_params_path'")
                 continue
-            # If client reported skipped, we may need to recover num_examples from sidecar or fallbacks
+            
+            # Recover num_examples from sidecar if needed
             reported_examples = getattr(fit_res, "num_examples", 0) or 0
             if (metrics.get("skipped") is True) and (reported_examples == 0):
                 try:
@@ -399,64 +427,106 @@ class DiskFedAvg(FedAvg):
                             reported_examples = int(md.get("examples", 0) or 0)
                 except Exception:
                     pass
-            try:
-                params = _load_npz_dict(p)
-            except Exception as e:
-                print(f"[DiskServer] Failed to load client params from {p}: {e}")
-                continue
-
-            k, a = _flatten_params(params)
-            # Establish key order on first successful client
-            if acc_arrays is None:
-                keys_order = k
-                acc_arrays = []
-                for arr in a:
-                    if np.issubdtype(arr.dtype, np.floating):
-                        acc_arrays.append(
-                            arr.astype(self._agg_dtype, copy=False)
-                            * np.array(reported_examples, dtype=self._agg_dtype)
-                        )
-                    else:
-                        # Non-floating: keep first copy and ignore in weighted sum
-                        acc_arrays.append(arr)
-            else:
-                # Align by intersection of keys
-                key_to_idx = {kk: i for i, kk in enumerate(keys_order)}
-                for kk, arr in zip(k, a):
-                    if kk not in key_to_idx:
-                        continue
-                    i = key_to_idx[kk]
-                    if np.issubdtype(arr.dtype, np.floating):
-                        acc_arrays[i] += (
-                            arr.astype(self._agg_dtype, copy=False)
-                            * np.array(reported_examples, dtype=self._agg_dtype)
-                        )
-                    else:
-                        # keep first value (already in acc_arrays)
-                        pass
-
-            total_w += float(reported_examples)
+            
+            client_data.append((pathlib.Path(p), reported_examples, client_proxy))
             client_param_paths.append(pathlib.Path(p))
 
-        if acc_arrays is None or total_w == 0 or keys_order is None:
-            print("[DiskServer] No valid client arrays or zero weight; skip update")
+        if not client_data:
+            print("[DiskServer] No valid client paths; skip update")
             return ndarrays_to_parameters([]), {}
 
-        # Finalize average for floating arrays; saver will cast to configured store dtype
-        out_arrays: List[np.ndarray] = []
-        sw = np.array(total_w, dtype=self._agg_dtype)
-        for arr in acc_arrays:
-            if np.issubdtype(arr.dtype, np.floating):
-                out_arrays.append(arr / sw)
-            else:
-                out_arrays.append(arr)
+        # Phase 2: Parallel NPZ loading
+        fed_opt_enabled = _get_fed_opt_from_toml()
+        
+        def load_client_npz(path_examples_proxy):
+            path, examples, proxy = path_examples_proxy
+            try:
+                loaded_data = _load_npz_dict(path)
+                
+                if fed_opt_enabled and isinstance(loaded_data, dict) and "params" in loaded_data:
+                    # Fed_opt format: extract all components
+                    params = loaded_data.get("params", {})
+                    opt_state = loaded_data.get("opt_state", None)
+                    ema_params = loaded_data.get("ema_params", None)
+                    
+                    k, a = _flatten_params(params)
+                    
+                    # Also flatten optimizer state and EMA params if they exist
+                    opt_k, opt_a = (None, None)
+                    ema_k, ema_a = (None, None)
+                    
+                    if opt_state is not None:
+                        opt_k, opt_a = _flatten_params(opt_state)
+                    if ema_params is not None:
+                        ema_k, ema_a = _flatten_params(ema_params)
+                    
+                    return (k, a, opt_k, opt_a, ema_k, ema_a, examples, proxy, None)
+                else:
+                    # Standard format: only model parameters
+                    k, a = _flatten_params(loaded_data)
+                    return (k, a, None, None, None, None, examples, proxy, None)
+                    
+            except Exception as e:
+                return (None, None, None, None, None, None, examples, proxy, str(e))
 
-        new_params = traverse_util.unflatten_dict({k: v for k, v in zip(keys_order, out_arrays)})
-        # Overwrite single current global file in cache
+        loaded_clients = []
+        loaded_opt_states = []
+        loaded_ema_params = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(client_data))) as executor:
+            futures = [executor.submit(load_client_npz, cd) for cd in client_data]
+            # Collect results in deterministic order to avoid any append race conditions
+            results = []
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+            
+            # Process results sequentially (thread-safe)
+            for k, a, opt_k, opt_a, ema_k, ema_a, examples, proxy, error in results:
+                if error:
+                    print(f"[DiskServer] Failed to load client {proxy}: {error}")
+                    continue
+                loaded_clients.append((k, a, examples))
+                
+                # Store fed_opt components if available
+                if fed_opt_enabled:
+                    if opt_k is not None and opt_a is not None:
+                        loaded_opt_states.append((opt_k, opt_a, examples))
+                    if ema_k is not None and ema_a is not None:
+                        loaded_ema_params.append((ema_k, ema_a, examples))
+
+        if not loaded_clients:
+            print("[DiskServer] No valid client arrays; skip update")
+            return ndarrays_to_parameters([]), {}
+
+        # Phase 3: Aggregate model parameters (existing logic)
+        aggregated_params = self._aggregate_component(loaded_clients, "params")
+        
+        # Phase 4: Aggregate fed_opt components if enabled
+        aggregated_dict = {"params": aggregated_params}
+        
+        if fed_opt_enabled:
+            if loaded_opt_states:
+                aggregated_opt_state = self._aggregate_component(loaded_opt_states, "opt_state")
+                aggregated_dict["opt_state"] = aggregated_opt_state
+                print(f"[FedOpt] Aggregated optimizer states from {len(loaded_opt_states)} clients")
+            
+            if loaded_ema_params:
+                aggregated_ema_params = self._aggregate_component(loaded_ema_params, "ema_params")
+                aggregated_dict["ema_params"] = aggregated_ema_params
+                print(f"[FedOpt] Aggregated EMA parameters from {len(loaded_ema_params)} clients")
+
+        # Save the aggregated result
         new_current = self._current_global_file()
-        _save_params_npz(new_current, new_params, dtype=self._store_dtype)
+        if fed_opt_enabled and len(aggregated_dict) > 1:
+            # Save fed_opt format
+            _save_npz_dict(new_current, aggregated_dict, dtype=self._store_dtype)
+            print(f"[FedOpt] Saved aggregated training state: {new_current}")
+        else:
+            # Save standard format (only params)
+            _save_params_npz(new_current, aggregated_params, dtype=self._store_dtype)
+            print(f"[DiskServer] Updated current global params: {new_current}")
+        
         self._current_global_path = new_current
-        print(f"[DiskServer] Updated current global params: {new_current}")
         # Log aggregate summary
         try:
             client_paths = [str(p) for p in client_param_paths]
@@ -510,7 +580,7 @@ class DiskFedAvg(FedAvg):
 
                 items = {
                     "assets": save_assets,
-                    "params": {"params": new_params},
+                    "params": {"params": aggregated_params},
                 }
                 self._snapshot_manager.wait_until_finished()
                 self._snapshot_manager.save(real_round, items)
@@ -543,6 +613,69 @@ class DiskFedAvg(FedAvg):
 
         # We still need to return Parameters for framework consistency; keep empty to avoid memory
         return ndarrays_to_parameters([]), {"global_params_path": str(new_current)}
+
+    def _aggregate_component(self, loaded_data: List[Tuple], component_name: str) -> dict:
+        """Fast aggregation for a single component (params, opt_state, or ema_params).
+        
+        Args:
+            loaded_data: List of (keys, arrays, examples) tuples for the component
+            component_name: Name of the component being aggregated (for logging)
+            
+        Returns:
+            Dictionary containing the aggregated component
+        """
+        if not loaded_data:
+            return {}
+            
+        # Use first client as template
+        keys_order, template_arrays, first_examples = loaded_data[0]
+        key_to_idx = {kk: i for i, kk in enumerate(keys_order)}
+        
+        # Pre-allocate accumulators with proper dtype
+        acc_arrays = []
+        for arr in template_arrays:
+            if np.issubdtype(arr.dtype, np.floating):
+                # Initialize with first client's weighted contribution
+                acc_arrays.append(
+                    arr.astype(self._agg_dtype, copy=False) * np.array(first_examples, dtype=self._agg_dtype)
+                )
+            else:
+                # Non-floating: keep first copy
+                acc_arrays.append(arr.copy())
+        
+        total_w = float(first_examples)
+
+        # Vectorized accumulation for remaining clients
+        for k, a, examples in loaded_data[1:]:
+            weight = np.array(examples, dtype=self._agg_dtype)
+            for kk, arr in zip(k, a):
+                if kk not in key_to_idx:
+                    continue
+                i = key_to_idx[kk]
+                if np.issubdtype(arr.dtype, np.floating):
+                    # In-place accumulation for speed
+                    acc_arrays[i] += arr.astype(self._agg_dtype, copy=False) * weight
+            total_w += float(examples)
+
+        if total_w == 0:
+            print(f"[DiskServer] Zero total weight for {component_name}; returning empty")
+            return {}
+
+        # Vectorized final normalization
+        sw = np.array(total_w, dtype=self._agg_dtype)
+        out_arrays: List[np.ndarray] = []
+        for arr in acc_arrays:
+            if np.issubdtype(arr.dtype, np.floating):
+                # In-place division when possible to avoid extra allocation
+                if arr.dtype == self._agg_dtype:
+                    arr /= sw
+                    out_arrays.append(arr)
+                else:
+                    out_arrays.append(arr / sw)
+            else:
+                out_arrays.append(arr)
+
+        return traverse_util.unflatten_dict({k: v for k, v in zip(keys_order, out_arrays)})
 
     def configure_evaluate(self, server_round: int, parameters, client_manager):
         print(f"[DiskServer] Round {server_round}: evaluation disabled")
