@@ -687,8 +687,61 @@ class DiskFedAvg(FedAvg):
                 print(
                     f"[DiskServer] Snapshot saved (round {real_round}) -> {snap_dir}"
                 )
+                # Also append a JSONL record for easier debugging
+                try:
+                    self._append_jsonl(
+                        {
+                            "event": "snapshot_saved",
+                            "ts": time.time(),
+                            "round": int(real_round),
+                            "snapshot_dir": str(snap_dir),
+                        }
+                    )
+                except Exception:
+                    pass
+
+                # New: after snapshot is persisted, clear all client_* caches to avoid cross-round mixing
+                try:
+                    cache_root = self._cache_dir
+                    cleared = 0
+                    if cache_root.exists():
+                        for ch in cache_root.iterdir():
+                            # Preserve global/ but remove any client_*
+                            if ch.is_dir() and ch.name.startswith("client_"):
+                                try:
+                                    import shutil as _shutil
+                                    _shutil.rmtree(ch)
+                                    cleared += 1
+                                except Exception:
+                                    pass
+                    if cleared > 0:
+                        try:
+                            self._append_jsonl(
+                                {
+                                    "event": "client_cache_cleared",
+                                    "ts": time.time(),
+                                    "round": int(real_round),
+                                    "count": int(cleared),
+                                    "cache_dir": str(cache_root),
+                                }
+                            )
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"[DiskServer] Client cache clear skipped: {e}")
             except Exception as e:
                 print(f"[DiskServer] Snapshot failed at round {server_round}: {e}")
+                try:
+                    self._append_jsonl(
+                        {
+                            "event": "snapshot_failed",
+                            "ts": time.time(),
+                            "round": int(real_round),
+                            "error": str(e),
+                        }
+                    )
+                except Exception:
+                    pass
 
         # Cleanup client files for this round
         if self._delete_client_files:

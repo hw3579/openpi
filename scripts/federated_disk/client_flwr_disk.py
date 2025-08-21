@@ -505,51 +505,34 @@ class OpenPIFlowerDiskClient(NumPyClient):
         rnd = int(config.get("server_round", 0))
         # Fast-path: if this round's params already exist (from a previous partial run), skip heavy init/training
         try:
-            out_path = self.out_cache_dir / f"client_{self.client_id}" / f"round_{rnd:05d}" / "params.npz"
-            if out_path.exists():
-                # Prefer sidecar meta for examples; fallback to JSONL; else approximate
-                examples = None
-                meta_file = out_path.parent / "meta.json"
+            # New save pattern: only use a rolling current/ directory per client.
+            cur_dir = self.out_cache_dir / f"client_{self.client_id}" / "current"
+            out_path = cur_dir / "params.npz"
+            meta_file = cur_dir / "meta.json"
+            # Skip if current/meta.json exists and matches this round, and params file exists
+            if out_path.exists() and meta_file.exists():
                 try:
-                    if meta_file.exists():
-                        with open(meta_file, "r", encoding="utf-8") as mf:
-                            md = json.load(mf)
+                    with open(meta_file, "r", encoding="utf-8") as mf:
+                        md = json.load(mf)
+                        if int(md.get("round", -1)) == rnd:
                             examples = int(md.get("examples", 0) or 0)
+                            if examples <= 0:
+                                # Fallbacks for examples if not in meta
+                                examples = int(self.cfg.batch_size) * int(self.local_steps)
+                            self._append_jsonl(
+                                {
+                                    "event": "round_skip_existing",
+                                    "ts": time.time(),
+                                    "round": int(rnd),
+                                    "client_id": int(self.client_id),
+                                    "saved_params_path": str(out_path),
+                                    "examples": int(examples),
+                                }
+                            )
+                            print(f"[DiskClient {self.client_id}] Skip training for round {rnd}: reuse {out_path}")
+                            return [], int(examples), {"saved_params_path": str(out_path), "skipped": True}
                 except Exception:
-                    examples = None
-                if examples is None:
-                    try:
-                        if self._log_file.exists():
-                            with open(self._log_file, "r", encoding="utf-8") as f:
-                                for line in f:
-                                    try:
-                                        rec = json.loads(line)
-                                    except Exception:
-                                        continue
-                                    if (
-                                        isinstance(rec, dict)
-                                        and rec.get("event") == "round_end"
-                                        and int(rec.get("round", -1)) == rnd
-                                        and int(rec.get("client_id", -1)) == int(self.client_id)
-                                    ):
-                                        examples = int(rec.get("examples", 0) or 0)
-                    except Exception:
-                        examples = None
-                if examples is None:
-                    examples = int(self.cfg.batch_size) * int(self.local_steps)
-                # Log skip event
-                self._append_jsonl(
-                    {
-                        "event": "round_skip_existing",
-                        "ts": time.time(),
-                        "round": int(rnd),
-                        "client_id": int(self.client_id),
-                        "saved_params_path": str(out_path),
-                        "examples": int(examples),
-                    }
-                )
-                print(f"[DiskClient {self.client_id}] Skip training for round {rnd}: reuse {out_path}")
-                return [], int(examples), {"saved_params_path": str(out_path), "skipped": True}
+                    pass
         except Exception:
             pass
         self._lazy_init()
@@ -632,9 +615,10 @@ class OpenPIFlowerDiskClient(NumPyClient):
                         "avg_loss": (None if np.isnan(avg_loss) else float(avg_loss)),
                     }
                 )
-
         # Save params to disk and return path for server aggregation
-        out_path = self.out_cache_dir / f"client_{self.client_id}" / f"round_{rnd:05d}" / "params.npz"
+        cur_dir = self.out_cache_dir / f"client_{self.client_id}" / "current"
+        cur_dir.mkdir(parents=True, exist_ok=True)
+        out_path = cur_dir / "params.npz"
         path_str = _save_params_npz(out_path, self.state, dtype=self._store_dtype)
         # Write sidecar meta for resume-aware aggregation
         try:
@@ -644,7 +628,7 @@ class OpenPIFlowerDiskClient(NumPyClient):
                 "examples": int(examples),
                 "ts": time.time(),
             }
-            with open(out_path.parent / "meta.json", "w", encoding="utf-8") as mf:
+            with open(cur_dir / "meta.json", "w", encoding="utf-8") as mf:
                 json.dump(meta, mf, ensure_ascii=False)
         except Exception:
             pass
