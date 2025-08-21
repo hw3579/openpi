@@ -351,8 +351,9 @@ class OpenPIFlowerDiskClient(NumPyClient):
         batch_size: int | None = None,
         num_workers: int = 2,
         fsdp_devices: int = 1,
-        out_cache_dir: str | None = None,
-        store_precision: str = "fp16",
+    out_cache_dir: str | None = None,
+    store_precision: str = "fp16",
+    snapshot_exp: str | None = None,
     ) -> None:
         self.cfg = _config.get_config(config_name)
         self.cfg = dataclasses.replace(
@@ -377,10 +378,54 @@ class OpenPIFlowerDiskClient(NumPyClient):
         self.n_samples = 0
         self.out_cache_dir = pathlib.Path(out_cache_dir or "./cache/federated_disk").resolve()
         self.out_cache_dir.mkdir(parents=True, exist_ok=True)
-        # Logs directory for JSONL step-wise metrics (resume-friendly append)
-        self.logs_dir = pathlib.Path("./logs").resolve()
+        # Logs directory scoped by snapshot-exp for JSONL step-wise metrics (resume-friendly append)
+        # Prefer snapshot_exp from ctor; else read from pyproject.toml; fallback to 'flwr'
+        _snap_exp = snapshot_exp
+        if not _snap_exp:
+            try:
+                try:
+                    import tomllib as _tomllib  # Python 3.11+
+                except Exception:  # pragma: no cover
+                    import tomli as _tomllib  # type: ignore
+                with open(_ROOT / "pyproject.toml", "rb") as _f:
+                    _data = _tomllib.load(_f)
+                _snap_exp = (
+                    _data.get("tool", {}).get("flwr", {}).get("app", {}).get("config", {}).get("snapshot-exp", "flwr")
+                )
+            except Exception:
+                _snap_exp = "flwr"
+        self.logs_dir = (pathlib.Path("./logs") / str(_snap_exp)).resolve()
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self._log_file = self.logs_dir / f"client_{self.client_id}.jsonl"
+        # Best-effort migrate legacy ./logs/client_*.jsonl into scoped folder to avoid mixing
+        try:
+            legacy = (pathlib.Path("./logs").resolve() / f"client_{self.client_id}.jsonl").resolve()
+            if legacy.exists() and legacy != self._log_file:
+                import shutil as _shutil
+                if not self._log_file.exists():
+                    _shutil.move(str(legacy), str(self._log_file))
+                else:
+                    with open(legacy, "r", encoding="utf-8") as _src, open(self._log_file, "a", encoding="utf-8") as _dst:
+                        for _line in _src:
+                            _dst.write(_line)
+                    try:
+                        legacy.unlink(missing_ok=True)
+                    except TypeError:
+                        legacy.unlink()
+        except Exception:
+            pass
+        # Create a scoped flwr.log symlink if root flwr.log exists
+        try:
+            root_flwr = (pathlib.Path.cwd() / "flwr.log").resolve()
+            scoped_flwr = (self.logs_dir / "flwr.log").resolve()
+            if root_flwr.exists() and not scoped_flwr.exists():
+                try:
+                    os.symlink(str(root_flwr), str(scoped_flwr))
+                except OSError:
+                    import shutil as _shutil
+                    _shutil.copy2(str(root_flwr), str(scoped_flwr))
+        except Exception:
+            pass
         # Storage precision for mid-pipeline NPZ exchange
         sp = str(store_precision).lower()
         self._store_dtype = np.float16 if sp == "fp16" else np.float32
@@ -560,7 +605,6 @@ class OpenPIFlowerDiskClient(NumPyClient):
                 batch = (_model.Observation.from_dict(raw), raw["actions"])
                 with sharding.set_mesh(self.mesh):
                     self.state, info = self.ptrain_step(self.train_rng, self.state, batch)
-                examples += self.cfg.batch_size
                 try:
                     cur_loss = float(jax.device_get(info.get("loss", np.nan)))
                 except Exception:
@@ -671,6 +715,7 @@ def client_fn(context: Context) -> NumPyClient:
     fsdp_devices = context.run_config.get("fsdp-devices", 1)
     out_cache_dir = context.run_config.get("cache-dir", "./cache/federated_disk")
     store_precision = context.run_config.get("store-precision", "fp16")
+    snapshot_exp = context.run_config.get("snapshot-exp", "flwr")
 
     client = OpenPIFlowerDiskClient(
         config_name=config_name,
@@ -683,6 +728,7 @@ def client_fn(context: Context) -> NumPyClient:
     fsdp_devices=fsdp_devices,
     out_cache_dir=out_cache_dir,
     store_precision=store_precision,
+    snapshot_exp=snapshot_exp,
     )
     return client.to_client()
 

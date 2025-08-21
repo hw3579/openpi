@@ -212,7 +212,8 @@ def plot_clients_loss(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot federated client loss curves")
-    parser.add_argument("--logs-dir", type=str, default="logs", help="Directory containing client_*.jsonl")
+    parser.add_argument("--snapshot-exp", type=str, default="flwr", help="Experiment subfolder under logs/")
+    parser.add_argument("--logs-dir", type=str, default=None, help="Directory containing client_*.jsonl (overrides --snapshot-exp if set)")
     parser.add_argument("--clients", type=int, nargs="*", default=None, help="Client IDs to include (default: all)")
     parser.add_argument("--metric", type=str, default="loss", choices=["loss", "avg_loss"], help="Metric to plot")
     parser.add_argument("--local-steps", type=int, default=None, help="Fixed local steps per round; if omitted, infer from logs")
@@ -221,8 +222,9 @@ def main() -> None:
     parser.add_argument("--show", action="store_true", help="Show the figure interactively")
 
     args = parser.parse_args()
+    logs_dir = args.logs_dir if args.logs_dir else str(Path("logs") / args.snapshot_exp)
     out = plot_clients_loss(
-        logs_dir=args.logs_dir,
+        logs_dir=logs_dir,
         clients=args.clients,
         metric=args.metric,
         local_steps=args.local_steps,

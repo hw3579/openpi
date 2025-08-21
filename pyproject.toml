@@ -190,6 +190,7 @@ snapshot-interval = 1                # 快照保存间隔（以轮为单位）
 # 快照的实验子目录名（默认 flwr），最终路径为 ./checkpoints/<config-name>/<snapshot-exp>/
 # snapshot-exp = "flwr_non_iid_0819_batch32"
 snapshot-exp = "flwr_iid_0820"
+# snapshot-exp = "test"
 resume = true                       # 是否从快照恢复
 
 # 是否在 cache 中保留每一轮的全局权重（不做保留策略删除）

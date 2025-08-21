@@ -63,6 +63,7 @@ from openpi.training import checkpoints as _checkpoints
 
 import orbax.checkpoint as ocp  # Only used to read initial checkpoints via _model.restore_params
 import flax.nnx as nnx
+from tqdm import tqdm  # type: ignore
 
 
 def _get_fed_opt_from_toml() -> bool:
@@ -153,11 +154,56 @@ class DiskFedAvg(FedAvg):
         self._snapshot_dir = pathlib.Path(snapshot_dir or default_snap_dir).resolve()
         self._snapshot_dir.mkdir(parents=True, exist_ok=True)
         self._snapshot_manager = None
+        # Remember snapshot experiment name for scoping logs
+        self._snapshot_exp = str(snapshot_exp)
 
-        # Logging
-        self._logs_dir = pathlib.Path("./logs").resolve()
+        # Logging (scope under logs/<snapshot_exp> to avoid mixing)
+        self._logs_dir = (pathlib.Path("./logs") / self._snapshot_exp).resolve()
         self._logs_dir.mkdir(parents=True, exist_ok=True)
         self._server_log = self._logs_dir / "server.jsonl"
+        # If a legacy log exists at ./logs/server.jsonl, move/merge it into the scoped folder
+        try:
+            legacy_log = pathlib.Path("./logs").resolve() / "server.jsonl"
+            if legacy_log.exists() and legacy_log != self._server_log:
+                import shutil
+                if not self._server_log.exists():
+                    shutil.move(str(legacy_log), str(self._server_log))
+                else:
+                    # Append legacy contents then remove legacy file
+                    with open(legacy_log, "r", encoding="utf-8") as src, open(self._server_log, "a", encoding="utf-8") as dst:
+                        for line in src:
+                            dst.write(line)
+                    try:
+                        legacy_log.unlink(missing_ok=True)
+                    except TypeError:
+                        legacy_log.unlink()
+            # Best-effort: place flwr.log under the same exp subdirectory
+            try:
+                root_flwr_log = (_ROOT / "flwr.log").resolve()
+                scoped_flwr_log = (self._logs_dir / "flwr.log").resolve()
+                if root_flwr_log.exists():
+                    # If scoped file doesn't exist, create a symlink to avoid disrupting writers
+                    if not scoped_flwr_log.exists():
+                        try:
+                            os.symlink(str(root_flwr_log), str(scoped_flwr_log))
+                        except FileExistsError:
+                            pass
+                        except OSError:
+                            # Fallback: copy once
+                            import shutil as _shutil
+                            _shutil.copy2(str(root_flwr_log), str(scoped_flwr_log))
+                else:
+                    # Also check legacy ./logs/flwr.log and move it into scoped folder
+                    legacy_flwr_log = (pathlib.Path("./logs").resolve() / "flwr.log").resolve()
+                    if legacy_flwr_log.exists():
+                        import shutil as _shutil
+                        _shutil.move(str(legacy_flwr_log), str(scoped_flwr_log))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # Fail-fast sticky flag
+        self._fatal_failure = False
 
     def _append_jsonl(self, obj: dict) -> None:
         try:
@@ -369,6 +415,16 @@ class DiskFedAvg(FedAvg):
     def configure_fit(self, server_round: int, parameters, client_manager):
         # Ensure resume/init completed so _round_offset is known
         self._initialize_pretrained()
+        # Extra safety: if last round triggered fail-fast, terminate here
+        if getattr(self, "_fatal_failure", False):
+            print("[DiskServer][FATAL] Previous round had failures; terminating.")
+            try:
+                self._append_jsonl(
+                    {"event": "configure_fit_abort_after_failure", "ts": time.time(), "round": int(server_round)}
+                )
+            except Exception:
+                pass
+            os._exit(2)
         real_round = self._round_offset + server_round
         # If we've already met/exceeded the target total rounds, do not schedule clients
         if self._target_total_rounds is not None and real_round > self._target_total_rounds:
@@ -421,6 +477,29 @@ class DiskFedAvg(FedAvg):
         print(
             f"[DiskServer] Round {server_round} (global {real_round}): aggregating {len(results)} results, {len(failures)} failures"
         )
+        # Fail-fast: if any client failed in this round, stop the whole program immediately
+        if failures and len(failures) > 0:
+            try:
+                details = []
+                for f in failures:
+                    try:
+                        details.append(str(f))
+                    except Exception:
+                        details.append("<unknown failure>")
+                print("[DiskServer][FATAL] Client failure(s) detected during aggregate_fit. Exiting.")
+                self._append_jsonl(
+                    {
+                        "event": "aggregate_fit_fail_fast",
+                        "ts": time.time(),
+                        "round": int(real_round),
+                        "failures": details,
+                    }
+                )
+                self._fatal_failure = True
+            except Exception:
+                pass
+            # Ensure immediate termination even if the framework catches exceptions
+            os._exit(2)
         if not results:
             return None, {}
 
@@ -458,78 +537,83 @@ class DiskFedAvg(FedAvg):
             print("[DiskServer] No valid client paths; skip update")
             return ndarrays_to_parameters([]), {}
 
-        # Phase 2: Parallel NPZ loading (original approach, with bounded parallelism)
+        # Phase 2+3: Serial per-component streaming aggregation with progress (lower peak memory)
         fed_opt_enabled = _get_fed_opt_from_toml()
 
-        def load_client_npz(path_examples_proxy):
-            path, examples, proxy = path_examples_proxy
-            try:
-                loaded_data = _load_npz_dict(path)
-
-                if fed_opt_enabled and isinstance(loaded_data, dict) and "params" in loaded_data:
-                    # Fed_opt format: extract all components
-                    params = loaded_data.get("params", {})
-                    opt_state = loaded_data.get("opt_state", None)
-                    ema_params = loaded_data.get("ema_params", None)
-
-                    k, a = _flatten_params(params)
-
-                    # Also flatten optimizer state and EMA params if they exist
-                    opt_k, opt_a = (None, None)
-                    ema_k, ema_a = (None, None)
-
-                    if opt_state is not None:
-                        opt_k, opt_a = _flatten_params(opt_state)
-                    if ema_params is not None:
-                        ema_k, ema_a = _flatten_params(ema_params)
-
-                    return (k, a, opt_k, opt_a, ema_k, ema_a, examples, proxy, None)
-                else:
-                    # Standard format: only model parameters
-                    k, a = _flatten_params(loaded_data)
-                    return (k, a, None, None, None, None, examples, proxy, None)
-
-            except Exception as e:
-                return (None, None, None, None, None, None, examples, proxy, str(e))
-
-        loaded_clients = []
-        loaded_opt_states = []
-        loaded_ema_params = []
-
-        max_workers = min(4, len(client_data))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futs = [executor.submit(load_client_npz, cd) for cd in client_data]
-            load_results = []
-            for future in concurrent.futures.as_completed(futs):
-                load_results.append(future.result())
-
-            for k, a, opt_k, opt_a, ema_k, ema_a, examples, proxy, error in load_results:
-                if error:
-                    print(f"[DiskServer] Failed to load client {proxy}: {error}")
+        def aggregate_component(component: str | None, label: str) -> dict:
+            keys = None
+            acc = None
+            total_w = 0.0
+            bar = tqdm(total=len(client_data), desc=f"{label}", leave=False, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}")
+            for (p, examples, proxy) in client_data:
+                w = float(examples)
+                if w <= 0:
+                    bar.update(1)
                     continue
-                loaded_clients.append((k, a, examples))
-                if fed_opt_enabled:
-                    if opt_k is not None and opt_a is not None:
-                        loaded_opt_states.append((opt_k, opt_a, examples))
-                    if ema_k is not None and ema_a is not None:
-                        loaded_ema_params.append((ema_k, ema_a, examples))
+                try:
+                    loaded = _load_npz_dict(p)
+                    pure = loaded
+                    if component is not None:
+                        if not isinstance(loaded, dict) or component not in loaded:
+                            bar.update(1)
+                            continue
+                        pure = loaded.get(component, {})
+                    k, a = _flatten_params(pure)
+                except Exception as e:
+                    print(f"[DiskServer] Load/flatten failed for {proxy} [{label}]: {e}")
+                    bar.update(1)
+                    continue
+                if keys is None:
+                    keys = k
+                    acc = []
+                    for i, arr in enumerate(a):
+                        if np.issubdtype(arr.dtype, np.floating):
+                            acc.append(arr.astype(self._agg_dtype, copy=False) * np.array(w, dtype=self._agg_dtype))
+                        else:
+                            acc.append(arr.copy())
+                        if (i % 2) == 0:
+                            bar.set_postfix(client=str(proxy), layer=f"{i+1}/{len(a)}")
+                    total_w = w
+                else:
+                    key_to_idx = {kk: i for i, kk in enumerate(keys)}
+                    for i, (kk, arr) in enumerate(zip(k, a)):
+                        j = key_to_idx.get(kk, None)
+                        if j is None:
+                            continue
+                        if np.issubdtype(arr.dtype, np.floating):
+                            acc[j] += arr.astype(self._agg_dtype, copy=False) * np.array(w, dtype=self._agg_dtype)
+                        if (i % 2) == 0:
+                            bar.set_postfix(client=str(proxy), layer=f"{i+1}/{len(a)}")
+                    total_w += w
+                bar.update(1)
+            # Close the bar explicitly to avoid leftover lines
+            try:
+                bar.close()
+            except Exception:
+                pass
+            if keys is None or acc is None or total_w == 0.0:
+                return {}
+            sw = np.array(total_w, dtype=self._agg_dtype)
+            out = []
+            for arr in acc:
+                out.append(arr / sw if np.issubdtype(arr.dtype, np.floating) else arr)
+            return traverse_util.unflatten_dict({k: v for k, v in zip(keys, out)})
 
-        if not loaded_clients:
+        # Aggregate params first
+        aggregated_params = aggregate_component(None if not fed_opt_enabled else "params", "params")
+        if not aggregated_params:
             print("[DiskServer] No valid client arrays; skip update")
             return ndarrays_to_parameters([]), {}
-
-        # Phase 3: Aggregate components using reusable aggregator
-        aggregated_params = self._aggregate_component(loaded_clients, "params")
         aggregated_dict = {"params": aggregated_params}
+
+        # Then optimizer and EMA serially (to bound memory)
         if fed_opt_enabled:
-            if loaded_opt_states:
-                aggregated_opt_state = self._aggregate_component(loaded_opt_states, "opt_state")
+            aggregated_opt_state = aggregate_component("opt_state", "opt")
+            if aggregated_opt_state:
                 aggregated_dict["opt_state"] = aggregated_opt_state
-                print(f"[FedOpt] Aggregated optimizer states from {len(loaded_opt_states)} clients")
-            if loaded_ema_params:
-                aggregated_ema_params = self._aggregate_component(loaded_ema_params, "ema_params")
+            aggregated_ema_params = aggregate_component("ema_params", "ema")
+            if aggregated_ema_params:
                 aggregated_dict["ema_params"] = aggregated_ema_params
-                print(f"[FedOpt] Aggregated EMA parameters from {len(loaded_ema_params)} clients")
 
         # Save the aggregated result
         new_current = self._current_global_file()
