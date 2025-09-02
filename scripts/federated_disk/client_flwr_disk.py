@@ -3,7 +3,7 @@
 Goals
 - Avoid transmitting large ndarrays; only exchange file paths
 - Load params using Orbax helpers from openpi.models.model.restore_params
-- Save params to ./cache/federated_disk/client_<id>/round_<r>/params
+- Save params to ./cache/federated_disk/client_<id>/round_<r>/params.npz (per-round directory, consistent with Non-IID)
 - Deterministic IID uniform split across clients with a TOML-controlled split seed
 """
 from __future__ import annotations
@@ -505,34 +505,50 @@ class OpenPIFlowerDiskClient(NumPyClient):
         rnd = int(config.get("server_round", 0))
         # Fast-path: if this round's params already exist (from a previous partial run), skip heavy init/training
         try:
-            # New save pattern: only use a rolling current/ directory per client.
-            cur_dir = self.out_cache_dir / f"client_{self.client_id}" / "current"
-            out_path = cur_dir / "params.npz"
-            meta_file = cur_dir / "meta.json"
-            # Skip if current/meta.json exists and matches this round, and params file exists
-            if out_path.exists() and meta_file.exists():
+            # Per-round save pattern (aligned with Non-IID client)
+            out_path = self.out_cache_dir / f"client_{self.client_id}" / f"round_{rnd:05d}" / "params.npz"
+            if out_path.exists():
+                examples = None
+                meta_file = out_path.parent / "meta.json"
                 try:
-                    with open(meta_file, "r", encoding="utf-8") as mf:
-                        md = json.load(mf)
-                        if int(md.get("round", -1)) == rnd:
+                    if meta_file.exists():
+                        with open(meta_file, "r", encoding="utf-8") as mf:
+                            md = json.load(mf)
                             examples = int(md.get("examples", 0) or 0)
-                            if examples <= 0:
-                                # Fallbacks for examples if not in meta
-                                examples = int(self.cfg.batch_size) * int(self.local_steps)
-                            self._append_jsonl(
-                                {
-                                    "event": "round_skip_existing",
-                                    "ts": time.time(),
-                                    "round": int(rnd),
-                                    "client_id": int(self.client_id),
-                                    "saved_params_path": str(out_path),
-                                    "examples": int(examples),
-                                }
-                            )
-                            print(f"[DiskClient {self.client_id}] Skip training for round {rnd}: reuse {out_path}")
-                            return [], int(examples), {"saved_params_path": str(out_path), "skipped": True}
                 except Exception:
-                    pass
+                    examples = None
+                if examples is None:
+                    try:
+                        if self._log_file.exists():
+                            with open(self._log_file, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    try:
+                                        rec = json.loads(line)
+                                    except Exception:
+                                        continue
+                                    if (
+                                        isinstance(rec, dict)
+                                        and rec.get("event") == "round_end"
+                                        and int(rec.get("round", -1)) == rnd
+                                        and int(rec.get("client_id", -1)) == int(self.client_id)
+                                    ):
+                                        examples = int(rec.get("examples", 0) or 0)
+                    except Exception:
+                        examples = None
+                if examples is None:
+                    examples = int(self.cfg.batch_size) * int(self.local_steps)
+                self._append_jsonl(
+                    {
+                        "event": "round_skip_existing",
+                        "ts": time.time(),
+                        "round": int(rnd),
+                        "client_id": int(self.client_id),
+                        "saved_params_path": str(out_path),
+                        "examples": int(examples),
+                    }
+                )
+                print(f"[DiskClient {self.client_id}] Skip training for round {rnd}: reuse {out_path}")
+                return [], int(examples), {"saved_params_path": str(out_path), "skipped": True}
         except Exception:
             pass
         self._lazy_init()
@@ -588,6 +604,7 @@ class OpenPIFlowerDiskClient(NumPyClient):
                 batch = (_model.Observation.from_dict(raw), raw["actions"])
                 with sharding.set_mesh(self.mesh):
                     self.state, info = self.ptrain_step(self.train_rng, self.state, batch)
+                examples += self.cfg.batch_size
                 try:
                     cur_loss = float(jax.device_get(info.get("loss", np.nan)))
                 except Exception:
@@ -615,10 +632,8 @@ class OpenPIFlowerDiskClient(NumPyClient):
                         "avg_loss": (None if np.isnan(avg_loss) else float(avg_loss)),
                     }
                 )
-        # Save params to disk and return path for server aggregation
-        cur_dir = self.out_cache_dir / f"client_{self.client_id}" / "current"
-        cur_dir.mkdir(parents=True, exist_ok=True)
-        out_path = cur_dir / "params.npz"
+        # Save params to disk (per-round directory) and return path for server aggregation
+        out_path = self.out_cache_dir / f"client_{self.client_id}" / f"round_{rnd:05d}" / "params.npz"
         path_str = _save_params_npz(out_path, self.state, dtype=self._store_dtype)
         # Write sidecar meta for resume-aware aggregation
         try:
@@ -628,7 +643,7 @@ class OpenPIFlowerDiskClient(NumPyClient):
                 "examples": int(examples),
                 "ts": time.time(),
             }
-            with open(cur_dir / "meta.json", "w", encoding="utf-8") as mf:
+            with open(out_path.parent / "meta.json", "w", encoding="utf-8") as mf:
                 json.dump(meta, mf, ensure_ascii=False)
         except Exception:
             pass

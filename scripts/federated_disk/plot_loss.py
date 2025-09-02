@@ -192,7 +192,7 @@ def plot_clients_loss(
 
     plt.xlabel("Local Step (cumulative across rounds)")
     plt.ylabel(metric)
-    plt.title("Client Loss Curves with Server Aggregations")
+    plt.title("FL-IID Client Loss Curves")
     plt.legend()
     plt.grid(True, alpha=0.2)
 

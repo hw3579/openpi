@@ -379,7 +379,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Parquet replay server (只支持Both模式)')
     parser.add_argument('--parquet_file', type=str, default='episode_000001.parquet',
                         help='Path to the parquet file')
-    parser.add_argument('--port', type=int, default=9001,
+    parser.add_argument('--port', type=int, default=19001,
                         help='Server port to listen on')
     parser.add_argument('--zero_state', action='store_true',
                         help='Whether to use zero state for robot state (default: False)')

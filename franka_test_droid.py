@@ -5,7 +5,7 @@ import argparse
 from openpi_client import websocket_client_policy, image_tools
 import threading
 
-MAX_STEPS = 120
+MAX_STEPS = 150
 step = 0
 
 def get_image_from_server(endpoint, server_url):
@@ -67,13 +67,13 @@ def get_realtime_data_from_rt_server(rt_server_url="http://192.168.191.210:9001"
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Franka robot control client')
-    parser.add_argument('--replay-server', type=str, default='http://192.168.191.143:9001',
+    parser.add_argument('--replay-server', type=str, default='http://192.168.191.143:19001',
                         help='Replay server URL (143 - for replay mode)')
     parser.add_argument('--rt-server', type=str, default='http://192.168.191.210:9001',
                         help='RT server URL (210 - for realtime mode)')
     parser.add_argument('--policy-host', type=str, default='localhost',
                         help='Policy websocket host (default: localhost)')
-    parser.add_argument('--policy-port', type=int, default=8000,
+    parser.add_argument('--policy-port', type=int, default=18000,
                         help='Policy websocket port (default: 8000)')
     parser.add_argument('--mode', type=str, choices=['rt', 'both', 'sim'], default='rt',
                         help='Operation mode: rt (realtime only), both (replay data input + realtime comparison), sim (simulation only, no RT server needed)')
@@ -90,10 +90,12 @@ def main(replay_server, rt_server, policy_host, policy_port, mode='rt'):
             print(f"Fetching replay data from server for model input: {replay_server}...")
             replay_img = get_image_from_server("image_raw", replay_server)
             replay_wrist_img = get_image_from_server("image_wrist", replay_server)
-            replay_instruction = get_instruction(replay_server)
             replay_robot_state = get_robot_state(replay_server)
-            
+    
             print(f"Replay robot state: {replay_robot_state}")
+
+            replay_instruction = get_instruction(rt_server)
+
             
             # Both模式：同时获取实时数据用于对比记录 (210)
             print(f"Fetching realtime data for comparison: {rt_server}...")

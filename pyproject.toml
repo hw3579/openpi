@@ -162,7 +162,7 @@ clientapp = "scripts.federated_disk.client_flwr_disk:app"
 # ------------------------------------------------------------
 [tool.flwr.app.config]
 # 训练轮数
-num-server-rounds = 15
+num-server-rounds = 30
 
 # 客户端参与条件
 min-fit-clients = 6

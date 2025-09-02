@@ -174,3 +174,5 @@ cython_debug/
 /.vscode
 *.zip
 *.parquet
+/tmp
+rsync_turin.sh

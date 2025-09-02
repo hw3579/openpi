@@ -267,7 +267,7 @@ class DiskFedAvg(FedAvg):
                     snap_dir = self._snapshot_dir / str(round_to_use)
                     # Restore from the 'params' item directory inside the checkpoint step dir
                     params = _model.restore_params(
-                        str(snap_dir / "params"), restore_type=np.ndarray, dtype=jnp.float16
+                        str(snap_dir / "params"), restore_type=np.ndarray
                     )
                     cur = self._current_global_file()
                     self._current_global_path = _save_params_npz(cur, params, dtype=self._store_dtype)
@@ -334,7 +334,7 @@ class DiskFedAvg(FedAvg):
                     f"Failed to download pretrained params from {params_path}: {e}"
                 )
             params = _model.restore_params(
-                local_params_path, restore_type=np.ndarray, dtype=jnp.float16
+                local_params_path, restore_type=np.ndarray
             )
             # Intersect with current model state's shapes to avoid mismatches (e.g., state_dim 32 vs 7)
             try:
