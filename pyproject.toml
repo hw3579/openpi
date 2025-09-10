@@ -213,7 +213,7 @@ default = "local-simulation"
 
 # ------------------------------------------------------------
 # 本地模拟（Simulation）环境
-# 使用 2 个虚拟 SuperNodes
+# 使用 6 个虚拟 SuperNodes
 # ------------------------------------------------------------
 [tool.flwr.federations.local-simulation]
 options.num-supernodes = 6
