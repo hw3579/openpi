@@ -14,6 +14,7 @@ from typing_extensions import override
 import tyro
 
 import openpi.models.model as _model
+import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0 as pi0
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
@@ -106,6 +107,17 @@ class ModelTransformFactory(GroupFactory):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
             case _model.ModelType.PI0:
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        ),
+                    ],
+                )
+            case _model.ModelType.PI05:
+                # Use the same transforms as PI0 (prompt tokenization + image resize)
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -1158,6 +1170,89 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
         batch_size=16,
+    ),
+
+############# 更新pi05#############
+    TrainConfig(
+        name="pi05_libero_0915_demo",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=7, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfigWithAug(
+            repo_id="hw3579/libero_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+            enable_image_aug=True,
+            aug_prob=0.8,
+            brightness_range=0.2,
+            contrast_range=(0.8, 1.2),
+            saturation_range=(0.8, 1.2),
+            hue_range=0.05,
+            crop_scale=(0.9, 0.9),
+            crop_ratio=(1.0, 1.0),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.PartialWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            skip_patterns=(
+                "action_in_proj",
+                "action_out_proj",
+                "action_expert",
+                "action_time_mlp_in",
+                "action_time_mlp_out",
+                "state_proj",
+            ),
+        ),
+        # pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+
+    # pi0.5 版本：对照 0804 增强全部数据集的配置，进行集中式微调
+    TrainConfig(
+        name="pi05_libero_0915_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=7,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfigWithAug(
+            repo_id="hw3579/libero_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+            # 与 0804_aug_all 一致的数据增强参数
+            enable_image_aug=True,
+            aug_prob=0.8,
+            brightness_range=0.2,
+            contrast_range=(0.8, 1.2),
+            saturation_range=(0.8, 1.2),
+            hue_range=0.05,
+            crop_scale=(0.9, 0.9),
+            crop_ratio=(1.0, 1.0),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            skip_patterns=(
+                "action_in_proj",
+                "action_out_proj",
+                "action_expert",
+                "action_time_mlp_in",
+                "action_time_mlp_out",
+                "state_proj",
+            ),
+        ),
+        batch_size=16,
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+        paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
 ]
 
