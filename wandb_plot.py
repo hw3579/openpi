@@ -4,11 +4,11 @@ import matplotlib.pyplot as plt
 import wandb
 from wandb import Api
 api = Api()          # 若本机已登录 `wandb login`；否则传入 api_key=...
-run = api.run("yaojiaqihw3579-1/openpi/opcb90yk")
+# run = api.run("yaojiaqihw3579-1/openpi/opcb90yk")
 
 entity = "yaojiaqihw3579-1"
 project = "openpi"
-run_id  = "opcb90yk"
+run_id  = "p81ny608"
 
 run = api.run(f"{entity}/{project}/{run_id}")
 
@@ -23,7 +23,7 @@ plt.figure()
 plt.plot(x, df["loss"])
 plt.xlabel("step")
 plt.ylabel("loss")
-plt.title(f"Centralize training loss")
+plt.title(f"Centralize training loss for PI05")
 plt.grid(True, alpha=0.3)
 # plt.yticks([0, 0.5, 1, 1.5, 2, 2.5, 3])
 # plt.ylim(0, 3)

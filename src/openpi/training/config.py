@@ -1172,6 +1172,50 @@ _CONFIGS = [
         batch_size=16,
     ),
 
+    # pi05 federated learning config (0918) based on pi0_libero_0813_fl and pi05 central demo.
+    TrainConfig(
+        name="pi05_libero_0918_fl",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=7,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            max_token_len=180,
+        ),
+        data=LeRobotLiberoDataConfigWithAug(
+            repo_id="hw3579/libero_state_7_crop",
+            base_config=DataConfig(prompt_from_task=True),
+            enable_image_aug=True,
+            aug_prob=0.8,
+            brightness_range=0.2,
+            contrast_range=(0.8, 1.2),
+            saturation_range=(0.8, 1.2),
+            hue_range=0.05,
+            crop_scale=(0.9, 0.9),
+            crop_ratio=(1.0, 1.0),
+        ),
+        weight_loader=weight_loaders.PartialWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            skip_patterns=(
+                "action_in_proj",
+                "action_out_proj",
+                "action_expert",
+                "action_time_mlp_in",
+                "action_time_mlp_out",
+                "state_proj",
+            ),
+        ),
+        # Federated learning typical smaller batch size per client.
+        batch_size=16,
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA style finetuning.
+        ema_decay=None,
+    ),
+
 ############# 更新pi05#############
     TrainConfig(
         name="pi05_libero_0915_demo",
@@ -1254,6 +1298,13 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+
+######################
+#0918 测试进行FL的测试
+###########################
+
+
+
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

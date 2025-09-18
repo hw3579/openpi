@@ -281,3 +281,30 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py pi05_libero_0915_lor
 
 uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi05_libero_0915_lora --policy.dir=checkpoints/pi05_libero_0915_lora/0915/29999
 
+
+############# 0918 pi0.5 fl
+
+pi05_libero_0915_lora
+
+export CUDA_VISIBLE_DEVICES=1
+uv run scripts/compute_norm_stats.py --config-name pi05_libero_0915_lora
+
+
+###推理运行方法to gsk
+
+east2 上面运行
+uv run scripts/serve_policy.py policy:checkpoint  --policy.config=pi05_libero_0915_lora --policy.dir=checkpoints/pi05_libero_0915_lora/0915/29999
+
+
+
+然后east1上面
+
+先运行droid的那个run server
+然后在开一个新窗口运行python ~/code/jiaqi_9001.py 好像是
+
+east2 上面最后：
+开一个新窗口运行 python franka_test_droid.py --mode rt
+
+然后在~/logs/下面 也就是 openpi 这个文件夹下面的../logs文件夹里面会保存相关图像和动作 每次推理前记得清空文件夹
+
+推理完毕后在openpi目录下面运行create_video.py 就能在../logs下面出现视频了
